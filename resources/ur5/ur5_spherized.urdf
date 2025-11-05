@@ -5,7 +5,7 @@
  <joint name="offset_joint" type="fixed">
     <parent link="offset_link"/>
     <child link="base_link"/>
-    <origin xyz="0.0 0.0 0.9144" rpy="0 0 1.57" />
+    <origin xyz="0.0 0.0 0.0" rpy="0 0 1.57" />
  </joint>
 	<link name="base_link">
 		<visual>
