@@ -3,7 +3,7 @@ from __future__ import annotations
 import jax.numpy as jnp
 from jaxtyping import Float, Array
 
-from ._geometry import HalfSpace, Sphere, Capsule, Heightmap
+from ._geometry import HalfSpace, Sphere, Capsule, Heightmap, Box
 from . import _utils
 
 
@@ -215,4 +215,148 @@ def heightmap_halfspace(
     # Find the minimum distance among all vertices.
     min_dist = jnp.min(vertex_distances, axis=-1)
     assert min_dist.shape == batch_axes
+    return min_dist
+
+
+# --- Box Collision Implementations ---
+
+
+def _accumulate_axis_distances(face_dists: Float[Array, "*batch 6"]) -> Float[Array, "*batch"]:
+    """Reduce six face distances to a single scalar distance.
+
+    face_dists ordering: (px, nx, py, ny, pz, nz)
+    For each axis we sum the positive parts of the two opposite-face distances
+    (i.e. how far outside the box along that axis the other object is). The
+    final distance is the Euclidean norm of the three axis contributions.
+    """
+    # positive contributions per face (separations)
+    pos = jnp.maximum(face_dists, 0.0)
+    dx = pos[..., 0] + pos[..., 1]
+    dy = pos[..., 2] + pos[..., 3]
+    dz = pos[..., 4] + pos[..., 5]
+    sep = jnp.sqrt(dx * dx + dy * dy + dz * dz)
+
+    # penetration case: if sep == 0 (no positive separation) we are inside the box
+    # Compute per-axis penetration (most negative face value per axis)
+    pen_x = jnp.minimum(face_dists[..., 0], face_dists[..., 1])
+    pen_y = jnp.minimum(face_dists[..., 2], face_dists[..., 3])
+    pen_z = jnp.minimum(face_dists[..., 4], face_dists[..., 5])
+    pen_mag = -jnp.sqrt(pen_x * pen_x + pen_y * pen_y + pen_z * pen_z)
+
+    # Choose separation when positive, otherwise penetration (negative)
+    dist = jnp.where(sep > 0.0, sep, pen_mag)
+    return dist
+
+
+def box_sphere(box: Box, sphere: Sphere) -> Float[Array, "*batch"]:
+    """Compute signed distance between an oriented box and a sphere.
+
+    Uses the standard box SDF in the box's local frame. This yields a signed
+    distance that grows (in absolute value) as penetration increases.
+    """
+    # Sphere center in box local frame
+    sph_pos_w = sphere.pose.translation()
+    sph_pos_b = box.pose.inverse().apply(sph_pos_w)
+
+    hl = box.half_lengths
+    q = jnp.abs(sph_pos_b) - hl
+    outside = jnp.linalg.norm(jnp.maximum(q, 0.0), axis=-1)
+    inside = jnp.minimum(jnp.max(q, axis=-1), 0.0)
+    sdist_box = outside + inside
+
+    dist = sdist_box - sphere.radius
+    return dist
+
+
+def box_capsule(box: Box, capsule: Capsule) -> Float[Array, "*batch"]:
+    """Compute distance between box and capsule by approximating the capsule
+    as a short series of spheres along its axis and taking the minimum.
+    """
+    # Approximate capsule by sampling spheres along its axis and taking the min.
+    n_segs = 8
+
+    cap_pos = capsule.pose.translation()
+    cap_axis = capsule.axis
+    segment_offset = cap_axis * capsule.height[..., None] / 2
+    a = cap_pos - segment_offset
+    b = cap_pos + segment_offset
+
+    t = jnp.linspace(0.0, 1.0, n_segs)
+    # centers shape: (n_segs, *batch_capsule, 3)
+    centers = a[None, ...] * (1.0 - t)[:, None, None] + b[None, ...] * t[:, None, None]
+
+    # radii shape: (n_segs, *batch_capsule)
+    radii = jnp.broadcast_to(capsule.radius, centers.shape[:-1])
+
+    # Build batched spheres
+    spheres = Sphere.from_center_and_radius(center=centers, radius=radii)
+
+    # Broadcast box to spheres batch axes and compute per-sphere distances
+    box_bc = box.broadcast_to(spheres.get_batch_axes())
+    dists = box_sphere(box_bc, spheres)
+    dist = jnp.min(dists, axis=0)
+    # Remove any accidental singleton dimensions introduced by sampling
+    return jnp.squeeze(dist)
+
+
+def box_halfspace(box: Box, halfspace: HalfSpace) -> Float[Array, "*batch"]:
+    """Compute signed distance between box and a halfspace plane.
+
+    We evaluate the halfspace plane signed distance at all eight box vertices
+    and return the minimum value. This gives a penetration depth that grows
+    (in absolute value) as the box penetrates the halfspace.
+    """
+    # Box vertices in local frame: combinations of +/- half_lengths
+    hl = box.half_lengths
+    # Create array of shape (8,3) with vertex signs
+    signs = jnp.array(
+        [[sx, sy, sz] for sx in (1.0, -1.0) for sy in (1.0, -1.0) for sz in (1.0, -1.0)]
+    )
+    verts_local = signs[None, ...] * hl[..., None, :]
+    # verts_local shape: (*batch_box, 8, 3)
+    verts_world = box.pose.apply(verts_local)
+
+    hs_n = halfspace.normal
+    hs_pt = halfspace.pose.translation()
+
+    # Broadcast for einsum: ensure hs_n and hs_pt have a vertices axis
+    hs_n_bc = jnp.broadcast_to(hs_n, verts_world.shape[:-1] + (3,))[..., None, :]
+    hs_pt_bc = jnp.broadcast_to(hs_pt, verts_world.shape[:-1] + (3,))[..., None, :]
+
+    vertex_distances = jnp.einsum("...vi,...i->...v", verts_world - hs_pt_bc, hs_n_bc.squeeze(-2))
+    min_dist = jnp.min(vertex_distances, axis=-1)
+    return min_dist
+
+
+def box_heightmap(box: Box, heightmap: Heightmap) -> Float[Array, "*batch"]:
+    """Compute approximate signed distance between box vertices and heightmap.
+
+    We check the heightmap surface under each of the box's eight vertices
+    (after transforming them into world then heightmap local frame) and
+    return the minimum vertical signed distance (vertex_z - surface_z).
+    """
+    hl = box.half_lengths
+    signs = jnp.array(
+        [[sx, sy, sz] for sx in (1.0, -1.0) for sy in (1.0, -1.0) for sz in (1.0, -1.0)]
+    )
+    verts_local = signs[None, ...] * hl[..., None, :]
+    verts_world = box.pose.apply(verts_local)
+
+    # verts_world shape: (*batch_box, 8, 3)
+    batch_axes = jnp.broadcast_shapes(box.get_batch_axes(), heightmap.get_batch_axes())
+    verts_world = jnp.broadcast_to(verts_world, batch_axes + verts_world.shape[-2:])
+
+    # Interpolate heightmap at each vertex world position: flatten verts for call
+    flat_verts = verts_world.reshape(batch_axes + (-1, 3))
+    # heightmap._interpolate_height_at_coords expects (*batch, 3) -> returns (*batch)
+    interp = heightmap._interpolate_height_at_coords(flat_verts)
+
+    # Reshape back to per-vertex and compute vertex z in heightmap local frame
+    interp = interp.reshape(batch_axes + (verts_world.shape[-2],))
+    verts_h = heightmap.pose.inverse().apply(verts_world)
+    vert_local_z = verts_h[..., 2]
+
+    # Signed vertical distance for each vertex: vertex_z - surface_z
+    vert_dists = vert_local_z - interp
+    min_dist = jnp.min(vert_dists, axis=-1)
     return min_dist

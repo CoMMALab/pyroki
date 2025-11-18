@@ -217,7 +217,135 @@ class Sphere(CollGeom):
 
         return Sphere.from_center_and_radius(center=center, radius=radius)
 
+@jdc.pytree_dataclass
+class Box(CollGeom):
+    """Box (Rectangular Prism) geometry."""
+    @property
+    def half_lengths(self) -> Float[Array, "*batch 3"]:
+        """Half-lengths along local X, Y, Z (size stores three values)."""
+        return self.size[..., :3]
 
+    @property
+    def extents(self) -> Float[Array, "*batch 3"]:
+        """Full extents (width, depth, height) = 2 * half_lengths."""
+        return 2.0 * self.half_lengths
+
+    @staticmethod
+    def from_center_and_half_lengths(
+        center: Float[ArrayLike, "*batch 3"],
+        half_lengths: Float[ArrayLike, "*batch 3"],
+        wxyz: Float[ArrayLike, "*batch 4"] | None = None,
+    ) -> Box:
+        """Create a Box from a center position, half-lengths and optional orientation.
+
+        NOTE: kept for backward compatibility; delegates to
+        `from_center_and_dimensions` by doubling half-lengths.
+        """
+        half_lengths = jnp.array(half_lengths)
+        lengths = 2.0 * half_lengths
+        return Box.from_center_and_dimensions(center=center, length=lengths[..., 0], width=lengths[..., 1], height=lengths[..., 2], wxyz=wxyz)
+
+    @staticmethod
+    def from_center_and_dimensions(
+        center: Float[ArrayLike, "*batch 3"],
+        length: Float[ArrayLike, "*batch"],
+        width: Float[ArrayLike, "*batch"],
+        height: Float[ArrayLike, "*batch"],
+        wxyz: Float[ArrayLike, "*batch 4"] | None = None,
+    ) -> Box:
+        """Create a Box from center, full `length`, `width`, `height` and optional orientation.
+
+        Args:
+            center: center position (*batch, 3).
+            length: full extent along local X-axis (*batch).
+            width: full extent along local Y-axis (*batch).
+            height: full extent along local Z-axis (*batch).
+            wxyz: optional quaternion(s) describing rotation (*batch, 4). If None,
+                  identity rotation is used.
+        Returns:
+            Box: new Box instance storing half-lengths internally.
+        """
+        center = jnp.array(center)
+        length = jnp.array(length)
+        width = jnp.array(width)
+        height = jnp.array(height)
+
+        if wxyz is None:
+            quat = jnp.array([1.0, 0.0, 0.0, 0.0])
+        else:
+            quat = jnp.array(wxyz)
+
+        batch_axes = jnp.broadcast_shapes(
+            center.shape[:-1], length.shape, width.shape, height.shape, quat.shape[:-1]
+        )
+
+        pos = jnp.broadcast_to(center, batch_axes + (3,))
+        quat_bc = jnp.broadcast_to(quat, batch_axes + (4,))
+        wxyz_xyz = jnp.concatenate([quat_bc, pos], axis=-1)
+        pose = jaxlie.SE3(wxyz_xyz)
+
+        half_lengths = jnp.stack([length / 2.0, width / 2.0, height / 2.0], axis=-1)
+        size = jnp.broadcast_to(half_lengths, batch_axes + (3,))
+        return Box(pose=pose, size=size)
+
+    def _create_one_mesh(self, index: tuple) -> trimesh.Trimesh:
+        """Create a trimesh box for a single batch entry at `index`."""
+        pose_i: jaxlie.SE3 = jax.tree.map(lambda x: x[index], self.pose)
+        pos = onp.array(pose_i.translation())
+        mat = onp.array(pose_i.rotation().as_matrix())
+        half_len = onp.array(self.half_lengths[index])
+        extents = (2.0 * half_len).tolist()
+
+        box_mesh = trimesh.creation.box(extents=extents)
+        tf = onp.eye(4)
+        tf[:3, :3] = mat
+        tf[:3, 3] = pos
+        box_mesh.apply_transform(tf)
+        return box_mesh
+
+    def as_halfspaces(self) -> tuple[HalfSpace, ...]:
+        """Return six `HalfSpace` objects representing the six faces of the box.
+
+        The returned halfspaces use outward-pointing normals.
+        Supports batching: the returned HalfSpace objects will have the same batch axes
+        as the box.
+        """
+        # Local half-lengths shape: (*batch, 3)
+        hl = self.half_lengths
+
+        # rotation matrix, shape (*batch, 3, 3)
+        R = self.pose.rotation().as_matrix()
+        t = self.pose.translation()
+
+        # World normals for +X, +Y, +Z are columns of R
+        nx = R[..., :, 0]
+        ny = R[..., :, 1]
+        nz = R[..., :, 2]
+
+        # Points on faces in world coordinates: center +/- axis * half_length
+        p_px = t + nx * hl[..., 0][..., None]
+        p_nx = t - nx * hl[..., 0][..., None]
+        p_py = t + ny * hl[..., 1][..., None]
+        p_ny = t - ny * hl[..., 1][..., None]
+        p_pz = t + nz * hl[..., 2][..., None]
+        p_nz = t - nz * hl[..., 2][..., None]
+
+        # Normals pointing outward
+        n_px = nx
+        n_nx = -nx
+        n_py = ny
+        n_ny = -ny
+        n_pz = nz
+        n_nz = -nz
+
+        hs_px = HalfSpace.from_point_and_normal(p_px, n_px)
+        hs_nx = HalfSpace.from_point_and_normal(p_nx, n_nx)
+        hs_py = HalfSpace.from_point_and_normal(p_py, n_py)
+        hs_ny = HalfSpace.from_point_and_normal(p_ny, n_ny)
+        hs_pz = HalfSpace.from_point_and_normal(p_pz, n_pz)
+        hs_nz = HalfSpace.from_point_and_normal(p_nz, n_nz)
+
+        return (hs_px, hs_nx, hs_py, hs_ny, hs_pz, hs_nz)
 
 @jdc.pytree_dataclass
 class Capsule(CollGeom):
