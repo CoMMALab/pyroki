@@ -1,3 +1,0 @@
-{
-    "difftori": "{\"task\": \"panda_reach_obstacle_dynamic\", \"teacher\": \"pyroffi.optimization_engines.dynamics_trajopt\", \"basis\": [\"effort\", \"collision\", \"smooth\", \"torque\"], \"theta_star\": [0.3, 0.18, 0.12, 0.4], \"feature_scales\": [4.349645108411604, 0.17180749044874782, 12.232710612373252, 656748.0278978074], \"n_contexts\": 200, \"n_timesteps\": 16, \"dt\": 0.1, \"discard_rate\": 0.0, \"max_stationarity_kept\": 4.4484109323622556e-06, \"demo_noise\": 0.0, \"torque_backend\": \"jax\", \"action_scale\": 0.3585773325471353, \"state_layout\": [\"q(7)\", \"dq(7)\", \"q_goal-q(7)\", \"obs_center-p_ee(3)\", \"obs_radius(1)\"], \"n_points\": 512, \"seed\": 0}"
-}

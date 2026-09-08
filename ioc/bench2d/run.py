@@ -16,6 +16,7 @@ number -- solves to reach a target outer loss -- is read off directly.
 
 import functools
 import json
+import os
 import time
 
 import jax
@@ -41,6 +42,17 @@ def make_dynamics_forward_solver(opt_cfg=DynamicsTrajOptConfig(n_iters=400)):
 def build_solver(res_fn, scales, T, d, cfg, n_iter, damping, unroll_tail, ridge,
                  n_restarts=1, topo_restarts=False, dynamics=False):
     """Adapt a benchmark's `res_fn(x, ctx, T, cfg)` to the shared inner solver.
+
+    `methods` selects which methods to run, as a comma-separated list
+    ("all" runs every one).  A subset run MERGES into `out` if it already
+    exists, so a single series can be re-run or added without redoing the
+    sweep:
+
+        python -m ioc.bench2d.run --benchmark segments --methods unrolled \
+            --out bench2d/bench2d_seg_K12.json ...
+
+    Every method sees the same problem either way -- theta*, contexts,
+    demonstration noise and z0 are drawn host-side from `seed` alone.
 
     `topo_restarts` swaps the default i.i.d.-jitter multistart for the
     structured lateral-detour seeding in `pb.make_topo_seed_fn` -- only
@@ -221,7 +233,7 @@ def _seed_dataset(res_fn, theta_stars, ctxs, keys, T, d, cfg, K, demo_iter,
 
 def run(benchmark, n_contexts, n_seeds, T, n_iter, budget, k_bumps, demo_noise,
         damping, unroll_tail, ridge, fd_eps, lr, cfg, out, n_restarts=1,
-        dynamics=False, topo_restarts=False):
+        dynamics=False, topo_restarts=False, methods=None):
     res_fn, _, d = pb.BENCHMARKS[benchmark]
     names = pb.benchmark_names(benchmark, k_bumps, cfg)
     if dynamics:
@@ -354,7 +366,22 @@ def run(benchmark, n_contexts, n_seeds, T, n_iter, budget, k_bumps, demo_noise,
     # how the solves are dispatched, never how many each fit is allowed.
     per_solve = n_contexts * n_restarts
     Z0 = jnp.stack(z0s)                                            # (S, K)
-    all_res = {f"s{seed}": {} for seed in range(n_seeds)}
+
+    # Methods can be run independently and merged into an existing results
+    # file (`methods=("unrolled",)` re-runs just that series and leaves every
+    # other method's numbers on disk untouched).  Seeding, contexts and
+    # demonstrations are drawn host-side from `seed` alone above, so a method
+    # run on its own sees exactly the problem it would have seen in a full
+    # sweep -- the merge is sound.
+    want = (lambda m: True) if not methods else (lambda m: m in set(methods))
+    prev = {}
+    if os.path.exists(out):
+        try:
+            prev = json.load(open(out)).get("results", {})
+        except (json.JSONDecodeError, OSError):
+            prev = {}
+    all_res = {f"s{seed}": dict(prev.get(f"s{seed}", {}))
+               for seed in range(n_seeds)}
 
     def record(name, Z, traces, wall, keep_theta=False):
         l1, rg, th = score_j(Z)
@@ -381,64 +408,74 @@ def run(benchmark, n_contexts, n_seeds, T, n_iter, budget, k_bumps, demo_noise,
         jax.block_until_ready(out[0])
         return out, time.perf_counter() - t0
 
+    # `li` also backs `fd` and `cmaes`, so it is built whenever any of the
+    # three is selected, not only for `implicit` itself.
     li = rows_loss(inner_unit.solve_implicit)
-    gi = outer_opt.summed_grad_fn(lambda Z: li(Z, sidx_1))
-    jax.block_until_ready(gi(Z0)[0])
-    (Z, trs), w = timed(lambda: outer_opt.adam_multi(
-        gi, Z0, lr=lr, budget_solves=budget, solves_per_step=per_solve,
-        trace_best=True))
-    record("implicit", Z, trs, w, keep_theta=True)
+    if want("implicit"):
+        gi = outer_opt.summed_grad_fn(lambda Z: li(Z, sidx_1))
+        jax.block_until_ready(gi(Z0)[0])
+        (Z, trs), w = timed(lambda: outer_opt.adam_multi(
+            gi, Z0, lr=lr, budget_solves=budget, solves_per_step=per_solve,
+            trace_best=True))
+        record("implicit", Z, trs, w, keep_theta=True)
 
-    lu = rows_loss(inner_unit.solve_unrolled)
-    gu = outer_opt.summed_grad_fn(lambda Z: lu(Z, sidx_1))
-    jax.block_until_ready(gu(Z0)[0])
-    (Z, trs), w = timed(lambda: outer_opt.adam_multi(
-        gu, Z0, lr=lr, budget_solves=budget, solves_per_step=per_solve,
-        trace_best=True))
-    record("unrolled", Z, trs, w)
+    if want("unrolled"):
+        lu = rows_loss(inner_unit.solve_unrolled)
+        gu = outer_opt.summed_grad_fn(lambda Z: lu(Z, sidx_1))
+        jax.block_until_ready(gu(Z0)[0])
+        (Z, trs), w = timed(lambda: outer_opt.adam_multi(
+            gu, Z0, lr=lr, budget_solves=budget, solves_per_step=per_solve,
+            trace_best=True))
+        record("unrolled", Z, trs, w)
 
-    fd_idx = jnp.asarray(outer_opt.fit_index_for(n_seeds, K + 1))
-    gfd = jax.jit(outer_opt.fd_grad_multi_fn(
-        lambda P: li(P, fd_idx), fd_eps, n_seeds, K))
-    jax.block_until_ready(gfd(Z0)[0])
-    (Z, trs), w = timed(lambda: outer_opt.adam_multi(
-        gfd, Z0, lr=lr, budget_solves=budget,
-        solves_per_step=(K + 1) * per_solve, trace_best=True))
-    record("fd", Z, trs, w)
+    if want("fd"):
+        fd_idx = jnp.asarray(outer_opt.fit_index_for(n_seeds, K + 1))
+        gfd = jax.jit(outer_opt.fd_grad_multi_fn(
+            lambda P: li(P, fd_idx), fd_eps, n_seeds, K))
+        jax.block_until_ready(gfd(Z0)[0])
+        (Z, trs), w = timed(lambda: outer_opt.adam_multi(
+            gfd, Z0, lr=lr, budget_solves=budget,
+            solves_per_step=(K + 1) * per_solve, trace_best=True))
+        record("fd", Z, trs, w)
 
-    lam = outer_opt.cma_population_size(K)
-    cma_idx = jnp.asarray(outer_opt.fit_index_for(n_seeds, lam))
-    cma_rows = jax.jit(lambda X: li(X, cma_idx))
-    jax.block_until_ready(cma_rows(jnp.repeat(Z0, lam, axis=0)))
-    (Z, trs), w = timed(lambda: outer_opt.cma_es_multi(
-        cma_rows, Z0, budget_solves=budget, solves_per_eval=per_solve,
-        seed=0, trace_best=True))
-    record("cmaes", Z, trs, w)
+    if want("cmaes"):
+        lam = outer_opt.cma_population_size(K)
+        cma_idx = jnp.asarray(outer_opt.fit_index_for(n_seeds, lam))
+        cma_rows = jax.jit(lambda X: li(X, cma_idx))
+        jax.block_until_ready(cma_rows(jnp.repeat(Z0, lam, axis=0)))
+        (Z, trs), w = timed(lambda: outer_opt.cma_es_multi(
+            cma_rows, Z0, budget_solves=budget, solves_per_eval=per_solve,
+            seed=0, trace_best=True))
+        record("cmaes", Z, trs, w)
 
     # The analytic baselines share the same unit-scale solver; each seed's
     # whitening rides in its own probe basis (see `analytic.kkt_fit`), which is
     # what lets a whole seed's fit be a `vmap` axis rather than a Python loop.
     bases = jax.vmap(lambda sc: jnp.diag(1.0 / sc))(scales_all)      # (S, K, K)
-    kkt_all = jax.jit(jax.vmap(
-        lambda ct, dm, b: analytic.kkt_fit(inner_unit.grad_x, ct, dm, K,
-                                           n_steps=600, basis=b)))
-    (Z,), w = timed(lambda: (kkt_all(ctxs_all, demos_all, bases),))
-    record("kkt", Z, None, w)
+    if want("kkt"):
+        kkt_all = jax.jit(jax.vmap(
+            lambda ct, dm, b: analytic.kkt_fit(inner_unit.grad_x, ct, dm, K,
+                                               n_steps=600, basis=b)))
+        (Z,), w = timed(lambda: (kkt_all(ctxs_all, demos_all, bases),))
+        record("kkt", Z, None, w)
 
-    cioc_all = jax.jit(jax.vmap(
-        lambda ct, dm, b: analytic.cioc_fit(inner_unit.grad_x,
-                                            inner_unit.gn_system, ct, dm, K,
-                                            n_steps=600, basis=b)))
-    (Z,), w = timed(lambda: (cioc_all(ctxs_all, demos_all, bases),))
-    record("cioc", Z, None, w, keep_theta=True)
+    if want("cioc"):
+        cioc_all = jax.jit(jax.vmap(
+            lambda ct, dm, b: analytic.cioc_fit(inner_unit.grad_x,
+                                                inner_unit.gn_system, ct, dm, K,
+                                                n_steps=600, basis=b)))
+        (Z,), w = timed(lambda: (cioc_all(ctxs_all, demos_all, bases),))
+        record("cioc", Z, None, w, keep_theta=True)
 
-    eiv_all = jax.jit(jax.vmap(
-        lambda ct, dm, b: analytic.eiv_fit(inner_unit.grad_x, ct, dm, K,
-                                           n_outer=5, n_inner=600, basis=b)))
-    (Z,), w = timed(lambda: (eiv_all(ctxs_all, demos_all, bases),))
-    record("eiv", Z, None, w)
+    if want("eiv"):
+        eiv_all = jax.jit(jax.vmap(
+            lambda ct, dm, b: analytic.eiv_fit(inner_unit.grad_x, ct, dm, K,
+                                               n_outer=5, n_inner=600, basis=b)))
+        (Z,), w = timed(lambda: (eiv_all(ctxs_all, demos_all, bases),))
+        record("eiv", Z, None, w)
 
-    record("random", Z0, None, 0.0)
+    if want("random"):
+        record("random", Z0, None, 0.0)
 
     for seed in range(n_seeds):
         all_res[f"s{seed}"]["_meta"] = dict(
@@ -446,7 +483,8 @@ def run(benchmark, n_contexts, n_seeds, T, n_iter, budget, k_bumps, demo_noise,
             theta_star=[float(v) for v in theta_stars[seed]])
         print(f"  seed {seed}: " + "  ".join(
             f"{k}={all_res[f's{seed}'][k]['regret']:.2e}"
-            for k in ["implicit", "fd", "cmaes", "kkt", "cioc", "eiv", "random"]))
+            for k in ["implicit", "fd", "cmaes", "kkt", "cioc", "eiv", "random"]
+            if k in all_res[f"s{seed}"]))
 
     with open(out, "w") as f:
         json.dump({"benchmark": benchmark, "K": K, "M": n_contexts,
@@ -457,6 +495,8 @@ def run(benchmark, n_contexts, n_seeds, T, n_iter, budget, k_bumps, demo_noise,
     print(f"\n{'method':>10s} {'theta L1':>10s} {'regret':>12s} "
           f"{'wall':>8s}   (wall = all %d seeds, batched)" % n_seeds)
     for m in ["implicit", "unrolled", "fd", "cmaes", "kkt", "cioc", "eiv", "random"]:
+        if any(m not in all_res[f"s{s}"] for s in range(n_seeds)):
+            continue
         l1 = np.median([all_res[f"s{s}"][m]["l1"] for s in range(n_seeds)])
         rg = np.median([all_res[f"s{s}"][m]["regret"] for s in range(n_seeds)])
         # `wall` is identical across seeds by construction: the seed axis is
@@ -491,6 +531,7 @@ def main(
     topo_restarts: bool = False,
     k_segments: int = 2,
     dynamics: bool = False,
+    methods: str = "all",
     out: str = "",
 ):
     """`dynamics` drives the benchmark through a synthetic GRiD-backed robot
@@ -520,7 +561,9 @@ def main(
     run(benchmark, n_contexts, n_seeds, n_timesteps, n_iter, budget, k_bumps,
         demo_noise, damping, unroll_tail, ridge, fd_eps, lr, cfg,
         out or f"bench2d_{benchmark}.json", n_restarts, dynamics,
-        topo_restarts=topo_restarts)
+        topo_restarts=topo_restarts,
+        methods=None if methods == "all" else tuple(
+            m.strip() for m in methods.split(",") if m.strip()))
 
 
 if __name__ == "__main__":

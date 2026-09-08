@@ -1,6 +1,6 @@
-1  # SCO TrajOpt: Sequential Convex Optimization for Trajectory Planning
+# SCO TrajOpt: Sequential Convex Optimization for Trajectory Planning
 
-This document explains the theory behind the SCO trajectory optimizer, its implementation in pyroffi, and the key engineering decisions made to make it fast under JAX/JIT.
+This document explains the theory behind the SCO trajectory optimizer and its JAX/CUDA implementations. The [architecture flowcharts](#13-scoal-motion-generation-architecture) describe the current shared SCO+AL path. Earlier sections retain historical details of the collision-only implementation; their penalty-only, explicit-Jacobian, and backend-parity descriptions do not all apply to the current generic solver.
 
 **Reference:** Schulman et al., *"Finding Locally Optimal, Collision-Free Trajectories with Sequential Convex Optimization"*, RSS 2013.
 
@@ -20,6 +20,7 @@ This document explains the theory behind the SCO trajectory optimizer, its imple
 10. [JAX Implementation Details](#10-jax-implementation-details)
 11. [CUDA Implementation and Differences from JAX](#11-cuda-implementation-and-differences-from-jax)
 12. [Configuration Reference](#12-configuration-reference)
+13. [SCO+AL motion-generation architecture](#13-scoal-motion-generation-architecture)
 
 ---
 
@@ -445,3 +446,166 @@ Both backends accept the same `TrajOptConfig` and can be selected via `use_cuda=
 - **Increase `n_inner_iters`** if the inner subproblem is not being solved to near-optimality (watch the cost drop per outer iteration).
 - **Lower `smooth_min_temperature`** for tighter collision margins; raise it if gradients become noisy near obstacles.
 - **Increase `m_lbfgs`** for better curvature approximation at the cost of higher memory and compile time.
+
+## 13. SCO+AL motion-generation architecture
+
+Consider a hypothetical request to move a robot from `q_start` to `q_goal` in
+a fixed duration, avoiding obstacles and respecting actuator limits. Optimize
+the sampled positions `Q[B,T,d]`; reconstruct velocities and accelerations
+with finite differences, then obtain required torques with inverse dynamics.
+Here `B` is the number of seeds, `T` the waypoint count, and `d` the joint DOF.
+All waypoints are decision variables available together; the optimization
+does not require a sequential forward simulation to evaluate each path.
+
+The first diagram shows control flow; the second expands the shared physics
+evaluation service used to construct local models and assess trial paths.
+
+### Control flow: request to candidate motion
+
+```mermaid
+flowchart TD
+    subgraph APP[Application setup and seeding]
+        request["Point-to-point request<br/>Start, goal, scene, duration, robot limits"]
+        setup["Load robot and scene<br/>Prepare FK / collision data<br/>Build or load cached GRiD CUDA library"]
+        seed["Create B candidate paths<br/>Joint interpolation or Cartesian IK seeds<br/>Fix endpoints; choose dt"]
+        request --> setup --> seed
+    end
+
+    subgraph OPT[Generic JAX SCO + AL solve - mapped over seeds]
+        init["Initialize Q, multipliers = 0<br/>Per-term penalties and trust coefficient"]
+        anchor["Freeze current path Qk<br/>Evaluate residuals and local derivatives"]
+        model["SCO: linearize inequality residuals<br/>g_hat = g(Qk) + Jg(Qk) delta<br/>Keep equality residuals exact"]
+        objective["Build inner AL objective<br/>Base cost + constraint terms<br/>+ quadratic trust regularization"]
+        inner["L-BFGS inner iterations<br/>JAX value_and_grad and vector reductions<br/>Evaluate 5 line-search candidates"]
+        trial["Form trial path<br/>Preserve fixed endpoints<br/>Evaluate true nonlinear residuals and merit"]
+        accept{"Adaptive trust enabled?<br/>If enabled: sufficient actual / predicted decrease?"}
+        reject["Reject: retain Qk and multipliers<br/>Adjust trust coefficient"]
+        update["Accept Qtrial<br/>Dual ascent using TRUE residuals<br/>Increase penalties up to caps<br/>Adapt trust coefficient if enabled"]
+        stop{"Outer iteration cap<br/>or configured residual stop?"}
+        init --> anchor --> model --> objective --> inner --> trial --> accept
+        accept -->|"Disabled, or test passes"| update
+        accept -->|"Enabled and test fails"| reject
+        update --> stop
+        reject --> stop
+        stop -->|"Continue"| anchor
+    end
+
+    subgraph POST[Application validation and rollout]
+        validate["Validate and rank candidate paths<br/>True constraints, endpoints, objective<br/>Densify for between-waypoint checks"]
+        valid{"Any acceptable candidate?"}
+        motion["Select path and associated timing<br/>Optional forward simulation / controller rollout<br/>Revalidate if timing changes"]
+        retry["Reseed, increase budget, revise timing<br/>or report planning failure"]
+        validate --> valid
+        valid -->|"Yes"| motion
+        valid -->|"No"| retry
+    end
+    seed --> init
+    stop -->|"Return candidates"| validate
+    retry -.-> seed
+
+    classDef host fill:#eef2ff,stroke:#6366f1,color:#111827;
+    classDef opt fill:#ecfdf5,stroke:#059669,color:#111827;
+    classDef check fill:#fff7ed,stroke:#ea580c,color:#111827;
+    class request,setup,seed,validate,motion,retry host;
+    class init,anchor,model,objective,inner,trial,update,reject opt;
+    class accept,stop,valid check;
+```
+
+Within one outer iteration, multipliers and penalties are held fixed during
+the inner solve. For `h(Q)=0`, the AL contribution is
+`lambda·h + rho/2 ||h||²`. For `g(Q)<=0`, it is
+`(||max(0, mu + rho*g)||² - ||mu||²)/(2*rho)`.
+After accepting the trial, the shared core updates
+`lambda <- lambda + dual_scale*rho*h` and
+`mu <- max(0, mu + dual_scale*rho*g)` using the nonlinear residuals.
+
+With adaptive trust enabled, the ratio compares actual nonlinear AL-merit
+decrease against the local model's predicted decrease. Rejected trials keep
+the path, multipliers, and penalties; each attempted step still consumes an
+outer iteration. Trust adaptation is optional and defaults off.
+
+### Acceleration and differentiation: evaluating a path
+
+```mermaid
+flowchart LR
+    q["Path Q[B,T,d]<br/>Current, trial, or local-model anchor"]
+
+    subgraph KIN[Kinematics and geometry]
+        fk["FK<br/>Joint coordinates to link transforms<br/>JAX differentiable kinematics"]
+        centres["Place robot collision geometry<br/>Sphere centres in world coordinates"]
+        sdf["Self / world signed distances<br/>Pair reduction and smooth-min groups"]
+        collision["Collision inequality<br/>g_collision = margin - clearance"]
+        fk --> centres --> sdf --> collision
+    end
+
+    subgraph DYN[Dynamics - JAX plus GRiD CUDA]
+        fd["Local finite-difference stencils<br/>Q to velocity and acceleration at dt"]
+        ffi["JAX FFI and custom batching<br/>Fold batch and waypoint axes into a launch"]
+        grid["GRiD robot-specific CUDA kernels<br/>Inverse dynamics: tau = ID(q, qd, qdd)<br/>Optional external wrenches"]
+        torque["Automatic torque-limit residual<br/>max(0, abs(tau) - tau_max)"]
+        fd --> ffi --> grid --> torque
+    end
+
+    base["JAX base cost<br/>Smoothness, soft joint limits<br/>Optional task / effort terms"]
+    residuals["Cost and constraint blocks<br/>Used for model construction<br/>and true nonlinear trial checks"]
+    ad["JAX derivative composition<br/>jax.linearize gives Jg times delta<br/>value_and_grad gives inner gradients"]
+    rules["GRiD custom JVP rules<br/>Analytic dynamics derivatives<br/>Mass matrix for acceleration derivative"]
+    optimizer["SCO model and L-BFGS step<br/>Return to control-flow diagram"]
+
+    q --> fk
+    q --> fd
+    q --> base
+    q --> ffi
+    collision --> residuals
+    torque --> residuals
+    base --> residuals
+    residuals --> ad --> optimizer
+    grid -.-> rules -.-> ad
+
+    classDef jax fill:#ecfdf5,stroke:#059669,color:#111827;
+    classDef cuda fill:#dbeafe,stroke:#2563eb,color:#111827;
+    class q,fk,centres,sdf,collision,fd,torque,base,residuals,ad,optimizer jax;
+    class ffi,grid,rules cuda;
+```
+
+Solid arrows carry values or control; dashed arrows denote a retry or derivative
+relationship. GRiD calculates torques for prescribed accelerations here. It is
+not rolling the trajectory forward through time. Dynamics equality constraints
+can also be supplied, but the automatic position-path term is torque feasibility.
+
+### Mapping to the repository and limits of the diagram
+
+| Diagram component | Implementation and scope |
+|---|---|
+| Seeding and orchestration | [motion_generators/_trajopt.py](../src/pyroffi/motion_generators/_trajopt.py) supplies the existing seeding pattern. The combined collision-plus-GRiD route above is a hypothetical caller composition, not an automatic behavior of that motion generator. |
+| Generic solver | [optimization_engines/_dynamics_trajopt.py](../src/pyroffi/optimization_engines/_dynamics_trajopt.py): use the L-BFGS branch with constraint terms, `use_sco=True`, and optionally `adaptive_trust=True`. The caller supplies collision constraints; `robot`/`grid`/`dof` enable automatic torque terms. |
+| Outer / inner loops | [optimization_engines/_trajopt_core.py](../src/pyroffi/optimization_engines/_trajopt_core.py): `_al_outer_loop`, `_lbfgs_driver`, `_adaptive_trust_step`, and `AugmentedLagrangianTerm`. |
+| Collision and FK | [kinematics/_fk.py](../src/pyroffi/kinematics/_fk.py), [collision/_robot_collision.py](../src/pyroffi/collision/_robot_collision.py), and the collision residual construction in [_sco_optimization.py](../src/pyroffi/optimization_engines/_sco_optimization.py). The diagram uses the JAX FK/geometry route; dedicated CUDA alternatives are separate paths. |
+| Dynamics and derivatives | [dynamics/_contact.py](../src/pyroffi/dynamics/_contact.py) constructs the torque residual; [_grid_dynamics.py](../src/pyroffi/dynamics/_grid_dynamics.py) supplies FFI/custom JVPs, and [_grid_codegen.py](../src/pyroffi/dynamics/_grid_codegen.py) generates and caches robot-specific CUDA libraries. |
+| Validation and rollout | Application responsibilities in this hypothetical pipeline. An iteration cap or residual stop alone is not a feasibility certificate. |
+
+Batching exposes independent seeds and waypoint physics evaluations to the GPU.
+Finite-difference stencils couple nearby waypoints, and L-BFGS dot products
+require reductions. Outer and inner optimization steps remain sequential.
+Local linearization reuses an affine model during inner evaluations; it does
+not imply rerunning nonlinear FK and inverse dynamics for every affine trial.
+Exact nonlinear base costs or equality terms can still require those calls.
+
+The generic solver does not pin endpoints automatically: a caller can optimize
+only interior waypoints and reconstruct the endpoints in its residual/cost
+functions. The dedicated collision SCO solver instead masks and re-pins them.
+Likewise, the generic outer stop currently checks `max(abs(residual))`, including
+inequalities; application validation should check positive inequality violation
+and, when needed, stationarity and complementarity.
+
+The inner problem is convex only when its remaining base/equality terms and
+regularization preserve convexity. The automatic torque residual is pre-clipped:
+linearizing it strictly inside the feasible region gives zero local sensitivity
+to an approaching torque boundary. Signed torque inequalities are a possible
+caller-defined alternative.
+
+Finally, `sco_trajopt(use_cuda=True)` invokes the specialized collision CUDA
+kernel, which retains penalty continuation and finite-difference collision
+Jacobians. It does not implement the combined generic SCO+AL+GRiD route shown
+above. JAX can accelerate that combined route using GRiD CUDA physics without
+selecting the specialized CUDA SCO solver.

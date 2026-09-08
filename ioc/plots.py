@@ -201,7 +201,7 @@ def fig_scaling():
     if not files:
         print("  [skip] no segments sweep data")
         return
-    METHODS = ("implicit", "fd", "cmaes")
+    METHODS = ("implicit", "unrolled", "fd", "cmaes", "kkt", "cioc", "eiv", "random")
     Ks = []
     series = {m: [] for m in METHODS}
     lo = {m: [] for m in METHODS}
@@ -212,7 +212,11 @@ def fig_scaling():
         r = d["results"]
         Ks.append(d["K"])
         for m in METHODS:
-            vals = [solves_to(r[s][m]["trace"], 1e-2) for s in r]
+            # A file collected before a method existed simply has no entry;
+            # treat it as censored rather than crashing the whole figure.
+            vals = [solves_to(r[s][m]["trace"], 1e-2) for s in r if m in r[s]]
+            if not vals:
+                vals = [None] * len(r)
             ok = [v for v in vals if v]
             if len(ok) < len(vals):
                 censored.append((d["K"], m, len(ok), len(vals)))
@@ -235,7 +239,8 @@ def fig_scaling():
         print("  [fig1] no censoring: every seed reached the target")
 
     fig, ax = plt.subplots(1, 1, figsize=(COL1, 2.5))
-    for m in ("fd", "cmaes", "implicit"):
+    plot_order = ("random", "eiv", "cioc", "kkt", "fd", "cmaes", "unrolled", "implicit")
+    for m in plot_order:
         st = STYLE[m]
         ax.plot(Ks, series[m], marker=st["marker"], ls=st["ls"], color=st["color"],
                 label=st["label"], clip_on=False, zorder=3)
@@ -245,8 +250,10 @@ def fig_scaling():
     ax.set_xticks(Ks)
     tidy(ax)
     h, l = ax.get_legend_handles_labels()
-    order = [l.index(STYLE[m]["label"]) for m in ("implicit", "fd", "cmaes")]
-    ax.legend([h[i] for i in order], [l[i] for i in order], loc="upper left", ncol=1)
+    legend_order = ("implicit", "unrolled", "fd", "cmaes", "kkt", "cioc", "eiv", "random")
+    order = [l.index(STYLE[m]["label"])
+             for m in legend_order if STYLE[m]["label"] in l]
+    ax.legend([h[i] for i in order], [l[i] for i in order], loc="upper left", ncol=2, fontsize=6.5)
     fig.suptitle("Sample Efficiency vs. Cost Dimension", fontsize=9, y=1.0,
                 fontweight="bold")
     fig.tight_layout()
@@ -683,13 +690,30 @@ def _match_aspect(ext, ratio):
     return (x0, x1, y0, y1)
 
 
-def _tag_inside(ax, text):
+ALPHABET = "abcdefghijklmnopqrstuvwxyz"
+
+
+def _text_width_in(text, size, weight="normal"):
+    """Rendered width of `text` in inches, at the current rcParams family.
+
+    Laid out on a throwaway canvas: a layout that has to know whether a label
+    fits its column cannot get that from the point size alone, since the same
+    9 pt buys very different widths for "CIOC" and for a norm in mathtext.
+    """
+    fig = plt.figure(figsize=(1, 1))
+    t = fig.text(0, 0, text, fontsize=size, fontweight=weight)
+    w = t.get_window_extent(fig.canvas.get_renderer()).width / fig.dpi
+    plt.close(fig)
+    return w
+
+
+def _tag_inside(ax, text, size=7.5):
     """Panel letter inside the axes.
 
     Image panels are drawn edge to edge, so a tag placed above the frame either
     collides with the panel title or forces dead space between rows.
     """
-    ax.text(0.035, 0.96, text, transform=ax.transAxes, fontsize=7.5,
+    ax.text(0.035, 0.96, text, transform=ax.transAxes, fontsize=size,
             fontweight="bold", va="top", ha="left", zorder=6,
             bbox=dict(boxstyle="square,pad=0.16", fc="white", ec="none",
                       alpha=0.82))
@@ -857,7 +881,7 @@ def _recovery_render(data):
     fig = plt.figure(figsize=(COL2, 3.4))
     gs = fig.add_gridspec(n_rows, n_cols + 2,
                           width_ratios=[1] * n_cols + [0.05, 1.4],
-                          hspace=0.45, wspace=0.08)
+                          hspace=0.32, wspace=0.06)
     axes = []
     for idx, (th, lab, err, is_best) in enumerate(panels):
         r, c = divmod(idx, n_cols)
@@ -918,7 +942,7 @@ def _recovery_render(data):
     noise_lab = "High" if "highnoise" in name else "Low"
     fig.suptitle(f"Recovered Cost Fields Under {noise_lab} Demonstration Noise "
                 f"($\\sigma={demo_noise:g}$)", fontsize=9, y=0.99, fontweight="bold")
-    fig.subplots_adjust(left=0.005, right=0.995, top=0.91, bottom=0.06)
+    fig.subplots_adjust(left=0.002, right=0.998, top=0.92, bottom=0.04)
     finish(fig, name)
     return errs
 
@@ -956,6 +980,275 @@ def fig_recovery_highnoise(recompute=True, sigma=0.05, **kw):
     """
     return fig_recovery(recompute=recompute, demo_noise=sigma,
                         name="fig3b_recovery_highnoise", **kw)
+
+
+def fig_recovery_whole(font_scale=1.3, title="Recovered Cost Fields by Method"):
+    """Combined low- and high-noise recovery in one figure, from cached data.
+
+    Layout: the methods in `ORDER` split over 2 rows per half, plus a
+    trajectory column spanning both; the two halves are separated by a thin
+    rule, with a horizontal colorbar across the bottom.
+
+    `font_scale` multiplies every type size.  The whole layout is solved from
+    the resulting text metrics rather than from fixed fractions, so the row
+    gaps, margins and figure height follow the type instead of having to be
+    retuned by hand -- see the geometry block below.
+    """
+    from matplotlib.gridspec import GridSpec
+
+    data_lo = load_figdata("fig3_recovery")
+    data_hi = load_figdata("fig3b_recovery_highnoise")
+    if data_lo is None or data_hi is None:
+        print("  [skip] cached data missing for fig3 or fig3b")
+        return
+
+    # Type sizes at scale 1.0: the serif/STIX family and scale of fig4, one
+    # notch up, since this figure runs the full 7.16 in page width across 18
+    # panels.  `font_scale` takes the whole set up or down together.
+    s = float(font_scale)
+    FS_SUP, FS_TITLE, FS_LABEL = 10.5 * s, 9 * s, 8.5 * s
+    FS_TAG, FS_LEGEND, FS_ROW, FS_TICK = 8.5 * s, 8 * s, 10 * s, 8 * s
+
+    # Panel order: the baselines that attack the inverse problem directly on
+    # the top row, the methods that differentiate through the solve on the
+    # bottom, so the crossover between the two families reads down the rows.
+    # The split is at the halfway point, so keep the two rows the same length.
+    ORDER = ("kkt", "eiv", "cioc",
+             "implicit", "fd", "cmaes")
+    # Figure-local titles.  A method name has a fifth of the page width to fit
+    # in, so the citations stay in the caption; `STYLE` keeps the cited forms
+    # for the legends of the line figures, which have room for them.
+    LABELS = {"cioc": "CIOC", "eiv": "IOC-EIV",
+              "implicit": "Implicit diff.", "unrolled": "Unrolled diff."}
+
+    def _unpack(data):
+        c0 = _FieldCtx(data["centers"], data["widths"])
+        theta_star = np.asarray(data["theta_star"])
+        fits = list(zip([str(m) for m in data["fit_methods"]],
+                        [np.asarray(t) for t in data["fit_thetas"]]))
+        errs, best = data["errs"], str(data["best"])
+        demos = np.asarray(data["demos"])
+        paths = [np.asarray(p) for p in data["paths"]]
+        n_show, M = int(data["n_show"]), int(data["M"])
+        demo_noise = float(data["demo_noise"])
+        vmax = max(_field_grid(c0, th)[2].max()
+                   for th in [theta_star] + [t for _, t in fits])
+        by_method = dict(fits)
+        panels = [(by_method[m], LABELS.get(m, STYLE[m]["label"]), errs[m],
+                   m == best)
+                  for m in ORDER if m in by_method]
+        return c0, theta_star, fits, errs, best, demos, paths, n_show, M, \
+            demo_noise, vmax, panels
+
+    lo = _unpack(data_lo)
+    hi = _unpack(data_hi)
+    # Fixed 0-1 colour scale rather than the observed maximum, so a shade means
+    # the same cost across every panel and across regenerations of the figure.
+    vmax = 1.0
+    vmax_data = max(lo[10], hi[10])
+    if vmax_data > vmax:
+        print(f"  [warn] field maximum {vmax_data:.3f} exceeds the fixed "
+              f"colour limit {vmax:g}; those panels clip")
+
+    # --- page geometry, solved from the type ---------------------------------
+    # Everything below is in inches, then converted to figure fractions at the
+    # end.  Nothing is a tuned constant that `font_scale` would silently
+    # invalidate: the gaps and margins come from the measured height of the
+    # text that has to fit in them, and the trajectory column is narrowed just
+    # far enough that the widest panel subtitle clears its neighbour.
+    FIELD_EXT = (-2.5, 2.5, -1.9, 1.9)
+    field_ar = (FIELD_EXT[1] - FIELD_EXT[0]) / (FIELD_EXT[3] - FIELD_EXT[2])
+    fig_w = COL2
+    WSP = 0.10
+
+    def _line_h(pt):
+        """Height of one line of `pt` type, with room for descenders."""
+        return pt * 1.55 / 72.0
+
+    # Two equal rows of method panels per half; the grid follows the number of
+    # methods in ORDER rather than a hard-coded column count.
+    n_cols = (len(lo[11]) + 1) // 2
+
+    all_panels = list(lo[11]) + list(hi[11])
+    widest_sub = max(
+        _text_width_in(rf"$\|\hat\theta-\theta^\star\|_1={err:.2f}$",
+                       FS_LABEL, "bold")
+        for _, _, err, _ in all_panels if err is not None)
+    widest_title = max(_text_width_in(lab, FS_TITLE, "bold")
+                       for _, lab, _, _ in all_panels)
+
+    # Row gaps: each carries the xlabel of the row above and the title of the
+    # row below; the separator gap also carries the rule between halves.
+    gap_t = _line_h(FS_LABEL) + _line_h(FS_TITLE) + 0.05
+    gap_s = gap_t + _line_h(FS_TITLE) * 0.55
+
+    # Margins: whatever the text outside the panel block needs.
+    m_left = _line_h(FS_ROW) + 0.04            # rotated row label
+    # The colorbar runs to the block's right edge and its last tick label is
+    # centred there, so half of it hangs past; leave room or the tight bbox
+    # pushes the saved figure over the 7.16 in column width.
+    m_right = _text_width_in(f"{vmax:g}", FS_TICK) / 2 + 0.02
+    m_top = _line_h(FS_SUP) + _line_h(FS_TITLE) + 0.08 if title \
+        else _line_h(FS_TITLE) + 0.03
+    cb_h = max(0.075, 0.09 * s)
+    m_bot = (_line_h(FS_LABEL) + 0.13 + cb_h + _line_h(FS_TICK)
+             + _line_h(FS_LABEL) + 0.04)
+
+    avail_w = fig_w - m_left - m_right
+    # wspace is a fraction of the *mean* column width; with four gaps over five
+    # columns that inflates the block by this factor whatever the ratios are.
+    k_wsp = 1 + WSP * n_cols / (n_cols + 1)
+
+    # Field-column width `u` as a function of the trajectory cell's aspect:
+    # the trajectory cell spans two field rows plus the gap between them, so
+    # its width is traj_ar * (2v + gap_t) and the block must still fit
+    # `avail_w`.  Solving 4u + traj_ar*(2u/field_ar + gap_t) = avail_w/k_wsp:
+    def _col_width(traj_ar):
+        return ((avail_w / k_wsp - traj_ar * gap_t)
+                / (n_cols + 2 * traj_ar / field_ar))
+
+    # A subtitle wider than its column pitch collides with its neighbour's.
+    # Give the trajectory panel the most width that still leaves the pitch
+    # clear, walking down from a near-square cell.
+    TRAJ_AR_MAX, TRAJ_AR_MIN = 1.05, 0.60
+    traj_ar = TRAJ_AR_MAX
+    while traj_ar > TRAJ_AR_MIN:
+        u = _col_width(traj_ar)
+        traj_w = traj_ar * (2 * u / field_ar + gap_t)
+        pitch = u + WSP * (n_cols * u + traj_w) / (n_cols + 1)
+        if pitch >= widest_sub + 0.03 and pitch >= widest_title + 0.03:
+            break
+        traj_ar -= 0.01
+    else:
+        u = _col_width(TRAJ_AR_MIN)
+        print(f"  [warn] at font_scale={s:g} the widest panel label "
+              f"({max(widest_sub, widest_title):.2f} in) does not fit the "
+              f"column pitch; labels will crowd")
+
+    v = u / field_ar
+    traj_w = traj_ar * (2 * v + gap_t)
+    block_h = 4 * v + 2 * gap_t + gap_s
+    fig_h = m_top + block_h + m_bot
+
+    L, R = m_left / fig_w, 1 - m_right / fig_w
+    TOP, BOT = 1 - m_top / fig_h, m_bot / fig_h
+
+    fig = plt.figure(figsize=(fig_w, fig_h))
+
+    # 5 content columns (4 field + 1 trajectory); 4 content rows (2 per half)
+    # with explicit spacer rows, so each gap is set independently and the
+    # colorbar is placed in the bottom margin rather than a grid row.  Ratios
+    # are passed in inches; GridSpec normalizes them.
+    gs = GridSpec(7, n_cols + 1, figure=fig,
+                  height_ratios=[v, gap_t, v, gap_s, v, gap_t, v],
+                  width_ratios=[u] * n_cols + [traj_w],
+                  hspace=0.0, wspace=WSP,
+                  left=L, right=R, top=TOP, bottom=BOT)
+
+    row_map = {0: (0, 2), 1: (4, 6)}
+    half_labels = {0: "Low noise", 1: "High noise"}
+    all_field_axes = []
+    traj_axes = []
+    im = None
+
+    for half, (c0, theta_star, fits, errs, best, demos, paths, n_show, M,
+               demo_noise, _, panels) in enumerate([lo, hi]):
+        r0, r1 = row_map[half]
+
+        axes = []
+        for idx, (th, lab, err, is_best) in enumerate(panels):
+            r_local, c = divmod(idx, n_cols)
+            ax = fig.add_subplot(gs[r0 + 2 * r_local, c])
+            axes.append(ax)
+            im = _draw_field_background(ax, c0, th, extent=FIELD_EXT, vmax=vmax)
+            ax.scatter(np.asarray(c0.centers)[:, 0],
+                       np.asarray(c0.centers)[:, 1],
+                       s=5, c="k", zorder=3, linewidths=0)
+            ax.set_xlim(FIELD_EXT[0], FIELD_EXT[1])
+            ax.set_ylim(FIELD_EXT[2], FIELD_EXT[3])
+            ax.set_aspect("equal")
+            ax.set_xticks([])
+            ax.set_yticks([])
+            ax.set_title(lab, fontsize=FS_TITLE, pad=2.5, fontweight="bold")
+            if err is not None:
+                ax.set_xlabel(rf"$\|\hat\theta-\theta^\star\|_1={err:.2f}$",
+                              labelpad=2, fontsize=FS_LABEL,
+                              fontweight="bold")
+        all_field_axes.extend(axes)
+
+        # Trajectory panel spanning both rows of this half.
+        axt = fig.add_subplot(gs[r0:r1 + 1, n_cols])
+        show = list(range(min(n_show, M)))
+        allp = demos[show][:, :, :2].reshape(-1, 2)
+        pad = 0.12
+        # Match the extent to the cell the panel actually got, so the panel
+        # fills it.  Read from the layout rather than from TRAJ_AR, so tuning
+        # any geometry constant above cannot reintroduce dead space.
+        cell = axt.get_position()
+        ext = _match_aspect(
+            (min(FIELD_EXT[0], allp[:, 0].min() - pad),
+             max(FIELD_EXT[1], allp[:, 0].max() + pad),
+             min(FIELD_EXT[2], allp[:, 1].min() - pad),
+             max(FIELD_EXT[3], allp[:, 1].max() + pad)),
+            (cell.width * fig_w) / (cell.height * fig_h))
+        _draw_field_background(axt, c0, theta_star, extent=ext, vmax=vmax)
+        # Demonstrations only.  The panel's job is now to show how much the
+        # noise roughens the demonstrations between (i) and (r), so draw them
+        # opaque, at full width, and mark every knot: the jaggedness lives in
+        # the per-knot deviation, which a thin translucent line hides.
+        for j, i in enumerate(show):
+            dm = demos[i][:, :2]
+            axt.plot(dm[:, 0], dm[:, 1], color=DEMO_C, lw=1.0, alpha=1.0,
+                     solid_joinstyle="miter", zorder=3,
+                     label="demonstration" if j == 0 else None)
+            axt.scatter(dm[:, 0], dm[:, 1], s=3.2, color=DEMO_C,
+                        linewidths=0, zorder=4)
+        axt.set_xlim(ext[0], ext[1])
+        axt.set_ylim(ext[2], ext[3])
+        axt.set_aspect("equal")
+        axt.set_xticks([])
+        axt.set_yticks([])
+        axt.set_title("Trajectories", fontsize=FS_TITLE, pad=2.5,
+                      fontweight="bold")
+        axt.set_xlabel(rf"$\sigma={demo_noise:g}$", labelpad=2,
+                       fontsize=FS_LABEL, fontweight="bold")
+        traj_axes.append(axt)
+
+        # Letters run straight through both halves, trajectory panel included.
+        per_half = len(axes) + 1
+        letters = ALPHABET[half * per_half:(half + 1) * per_half]
+        for ax, tag in zip(axes + [axt],
+                           (f"({c})" for c in letters)):
+            _tag_inside(ax, tag, size=FS_TAG)
+
+        # Row label, centred in the left margin the grid leaves for it.
+        noise_lab = f"{half_labels[half]} ($\\sigma={demo_noise:g}$)"
+        mid_y = (axes[0].get_position().y1 + axes[-1].get_position().y0) / 2
+        fig.text(L / 2, mid_y, noise_lab, rotation=90, ha="center",
+                 va="center", fontsize=FS_ROW, fontstyle="italic")
+
+    # Thin rule between halves, run to the panel block's own edges.
+    n_lo = len(lo[11])
+    sep_y = (all_field_axes[n_lo - 1].get_position().y0
+             + all_field_axes[n_lo].get_position().y1) / 2
+    fig.add_artist(plt.Line2D([L, R], [sep_y, sep_y],
+                   transform=fig.transFigure, color="#cccccc",
+                   linewidth=0.5, zorder=0))
+
+    # Horizontal colorbar spanning the full panel block along the bottom, sat
+    # on top of the space its own ticks and label need.
+    cb_y = (_line_h(FS_TICK) + _line_h(FS_LABEL) + 0.04) / fig_h
+    cax = fig.add_axes([L, cb_y, R - L, cb_h / fig_h])
+    cb = fig.colorbar(im, cax=cax, orientation="horizontal")
+    cb.set_label("Cost", fontsize=FS_LABEL, labelpad=2, fontweight="bold")
+    cb.ax.tick_params(labelsize=FS_TICK, width=0.5, length=2.0, pad=1.5)
+    cb.outline.set_linewidth(0.4)
+
+    if title:
+        fig.suptitle(title, fontsize=FS_SUP, fontweight="bold",
+                     y=1 - 0.35 * _line_h(FS_SUP) / fig_h, va="center")
+
+    finish(fig, "fig3_recovery_whole")
 
 
 def fig_noise():

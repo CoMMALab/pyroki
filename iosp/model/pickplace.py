@@ -78,6 +78,51 @@ from pyroffi.optimization_engines import _implicit_diff
 _implicit_diff.CANONICAL_BY_DEFAULT = True
 from pyroffi.optimization_engines._sqp_ik import sqp_ik_solve_cuda_batch
 
+# -- the `upright` feature -----------------------------------------------------
+# MEASURED on the ten FR3 teleop episodes (scratch/e10_upright_diag.py): the old
+# residual `quat[1:3]` is ~0.985 on the demonstrations, i.e. essentially its
+# MAXIMUM.  Its zero is not the down orientation -- a straight-down gripper is
+# `DOWN_WXYZ=[0,1,0,0]`, whose `quat[1:3]=[1,0]` -- so minimizing it drives the
+# wrist toward pointing UP, and any fit on human demos can only respond by
+# starving the weight.  `iosp/checks/identifiability.py` measured the same thing
+# from the other side on synthetic data: cos(transport.smooth, transport.upright)
+# = -0.9999, and `e1_minimal_identifiable` swapped the feature out for that
+# reason.  It is replaced here rather than worked around per-experiment.
+#
+# The correct, yaw-free measure is the world-frame xy of the EE approach axis
+# R(quat) @ [0,0,1] = [2(xz+wy), 2(yz-wx)]: zero for any down(+yaw) grasp and
+# nonzero exactly when the tool tips off vertical.  This is the same quantity
+# `upright_constraint_fn` already uses, so the soft feature and the hard
+# constraint can no longer disagree about what "upright" means.
+#
+# DEADBAND: the operators are not gripper-down.  Their tilt off vertical is 17.7
+# deg on average over the whole path and 20.8 deg (max 49.9) through transport,
+# so a term whose zero is exact verticality penalizes motion the demonstrations
+# actually contain and is misspecified even in its corrected form.  The feature
+# is therefore a hinge outside a deadband: inert on demonstrated tilt, and a
+# grasp-retention ("do not tip the object out") penalty only past it.
+# `UPRIGHT_TILT_DEADBAND` is sin(tilt), so 0.5 = 30 deg, above the demonstrated
+# mean and below the spill-grade excursions.  Softplus-smoothed on the same
+# reasoning as `RobotProblem.clearance_residual`: a hard hinge is
+# nondifferentiable exactly on the ridge the solver rides, which stalls the
+# inner solve and invalidates the implicit adjoint.
+UPRIGHT_TILT_DEADBAND = 0.5
+UPRIGHT_SOFTNESS = 20.0
+
+
+def tool_axis_tilt_residual(quat, deadband=UPRIGHT_TILT_DEADBAND):
+    """(T, 4) wxyz -> (T,) hinge on how far the tool axis tips off vertical.
+
+    Zero (to softplus precision) while the tilt is within `deadband`; grows
+    linearly beyond it.  Yaw about world z is free by construction.
+    """
+    w, x, y, z = quat[:, 0], quat[:, 1], quat[:, 2], quat[:, 3]
+    axis_xy = jnp.stack([2.0 * (x * z + w * y), 2.0 * (y * z - w * x)], axis=-1)
+    # sqrt is smoothed away from 0: the gradient of ||a|| is undefined at a = 0,
+    # which is precisely where a well-behaved (vertical) waypoint sits.
+    tilt = jnp.sqrt(jnp.sum(axis_xy ** 2, axis=-1) + 1e-12)
+    return jax.nn.softplus(UPRIGHT_SOFTNESS * (tilt - deadband)) / UPRIGHT_SOFTNESS
+
 N_APPROACH = 8
 N_GRASP = 4
 N_TRANSPORT = 10
@@ -86,12 +131,60 @@ PHASES = ("approach", "grasp", "transport", "place")
 SEGMENT_LEN = {"approach": N_APPROACH, "grasp": N_GRASP,
                "transport": N_TRANSPORT, "place": N_PLACE}
 
-SEGMENT_FEATURES = {
-    "approach": ("smooth", "clearance"),
-    "grasp": ("smooth",),
-    "transport": ("smooth", "clearance", "upright"),
-    "place": ("smooth",),
-}
+# -- the cost basis ----------------------------------------------------------
+# The standard trajopt basis, TIED across phases: one weight vector, applied to
+# approach/grasp/transport/place alike.
+#
+# Tied, not per-phase, for a measured reason.  Each segment minimizes
+# `sum_i w_i ||r_i||^2` with FIXED endpoints, so its solution depends only on the
+# RATIOS of that phase's own weights -- the per-phase scale is gauge.  Under the
+# old per-phase basis that left `grasp` and `place` (single-feature DWELL
+# segments, `Scene(q_pick, q_pick)`) with weights that could not change the
+# answer at all, and the identifiable count was approach 1 + transport 2 + 0 + 0
+# = 3, which is exactly the Gram rank E10 measured.  A tied vector has ONE global
+# scale gauge instead of four, so 6 features give 5 identifiable directions.
+#
+# The features, and how each scales with the segment duration T -- the spread of
+# exponents is what makes the speed/smoothness trade-off well posed:
+#
+#   time       T                  the duration itself
+#   path       T^0                EE arc length; purely geometric
+#   accel      T^-2               joint acceleration (the old `smooth`)
+#   jerk       T^-3               joint jerk
+#   effort     mixed              RNEA torque: inertial ~T^-2, gravity ~T^0
+#   clearance  T^0                hinge on distance to the world
+#
+# `path` is measured in EE space, not joint space, deliberately: a joint-space
+# arc length is a first difference and would sit in the same family as `accel`
+# and `jerk`, which is how `upright` came to be -0.9999 collinear with `smooth`
+# (see `iosp/checks/identifiability.py` and `e1_minimal_identifiable`).  A
+# Cartesian path length is structurally unrelated to the joint-space derivatives.
+#
+# `upright` is GONE from the basis.  Keeping the gripper level during the carry
+# is grasp retention -- a task requirement, not a preference -- and belongs in
+# `upright_constraint_fn`'s hard constraint, which is where `build_teleop`'s own
+# "task events -> constraints, free space -> cost" philosophy puts it.
+STANDARD_FEATURES = ("time", "path", "accel", "jerk", "effort", "clearance")
+
+# Kept as a dict keyed by phase so every existing caller that iterates
+# `SEGMENT_FEATURES[phase]` is unchanged; every phase now carries the same basis.
+SEGMENT_FEATURES = {p: STANDARD_FEATURES for p in PHASES}
+
+# Nominal segment durations, seconds -- MEASURED as the median over the ten FR3
+# teleop episodes (scratch/e10_timing.py; the raw `stamp_ns` at the gripper
+# grasp/release cuts).  These set `T = duration_nominal * exp(s)`, so `s = 0`
+# (the seed) is a typical demonstration rather than an arbitrary scale.
+# `grasp` is NOT measured: `to_waypoints` cuts it as `(grasp_i, grasp_i + 1)`, a
+# SINGLE sample, so its "duration" is one sampling period (0.036 s at 27.8 Hz) --
+# an artefact of the skeleton, not a demonstrated quantity.  Feeding that through
+# `dt = T / (n - 1)` amplifies this dwell's `accel` by ~5.6e3 and its `jerk` by
+# ~4.4e5 against every other phase, and the inner solve stops converging
+# (measured: grasp stationarity 2.1e-1 against a 1e-3 tolerance, the worst of the
+# four phases).  It gets a plain nominal second instead, and is excluded from the
+# duration term of the loss -- there is no measurement there to fit.
+DURATION_NOMINAL = {"approach": 7.45, "grasp": 1.0, "transport": 7.03, "place": 4.67}
+# Phases whose demonstrated duration is real, and therefore fittable.
+TIMED_PHASES = tuple(p for p in PHASES if p != "grasp")
 
 
 def unpack_z(z):
@@ -101,19 +194,14 @@ def unpack_z(z):
 def split_trajopt(theta_trajopt):
     """Flat (K_TRAJOPT,) weight vector -> {phase: weights}.
 
-    Model logic, so it lives with the model.  It used to be
-    `recovery_bench._split_trajopt`, which meant every caller of the composed
-    forward map imported a benchmark script to reach a 6-line helper.
+    The basis is TIED, so this hands every phase the same vector.  The signature
+    is unchanged from the per-phase version, which is what keeps every caller of
+    the composed forward map working.
     """
-    out, i = {}, 0
-    for p in PHASES:
-        n = len(SEGMENT_FEATURES[p])
-        out[p] = theta_trajopt[i:i + n]
-        i += n
-    return out
-THETA_TRAJOPT_NAMES = tuple(
-    f"{seg}.{feat}" for seg in PHASES for feat in SEGMENT_FEATURES[seg]
-)
+    return {p: theta_trajopt for p in PHASES}
+
+
+THETA_TRAJOPT_NAMES = STANDARD_FEATURES
 K_TRAJOPT = len(THETA_TRAJOPT_NAMES)
 # The release point is NOT the bucket's axis.  MEASURED on the teleop set: every
 # one of ten operators let go 6.3 cm SHORT of the bucket centre, toward the arm
@@ -194,11 +282,11 @@ SKELETON_PLACE = (PHASE_SPAN["transport"][1] - 1,)                            # 
 # would only rescale that segment's cost by a constant, which leaves its argmin
 # unchanged -- so segments simply carry the first three features, and the
 # whitening scales stay per-stage (sigma is units, theta is preference).
-SHARED_FEATURES = ("smooth", "clearance", "upright", "torque")
+SHARED_FEATURES = STANDARD_FEATURES
 THETA_SHARED_NAMES = SHARED_FEATURES + ("skeleton",)
 K_SHARED = len(THETA_SHARED_NAMES)
 
-FULL_FEATURES = ("smooth", "clearance", "upright", "skeleton")
+FULL_FEATURES = STANDARD_FEATURES + ("skeleton",)
 THETA_FULL_NAMES = tuple(f"refine.{f}" for f in FULL_FEATURES)
 K_FULL = len(THETA_FULL_NAMES)
 
@@ -316,6 +404,79 @@ def make_composed_forward_solver(n_iters=60, *, soft_line_search=True,
     return forward_solver
 
 
+def make_stock_forward_solver(n_iters=60):
+    """Forward-only solver using the STOCK trajopt config (early_stop=True, hard
+    line search + hard curvature gate) -- the original SPaSM solver.
+
+    Compiles FAR faster than `make_composed_forward_solver`: it drops the two
+    soft surrogates (`soft_line_search`/`soft_curvature_gate`) and the
+    fixed-length unroll (`early_stop=False`) that exist ONLY to make q*(theta)
+    smooth for truncated-unrolling gradients, and those are what blow up the
+    cold compile.
+
+    SAFE for the implicit adjoint and for every derivative-free method.
+    `ioc.inner.solve_implicit` runs the forward under `stop_gradient` and
+    rebuilds curvature analytically at x* (H = jax.hessian(cost), one linear
+    solve), so -- per that module's docstring -- it "only needs x* to be a
+    stationary point, not to know how it was found".  Early stopping converges
+    to `grad_tol`, a TIGHTER stationary point than a fixed-length soft run, so
+    the adjoint's convergence precondition is if anything better met.
+
+    NOT for `solve_unrolled`, which differentiates THROUGH the solver and must
+    keep the fixed-length soft forward (`make_composed_forward_solver`)."""
+    from pyroffi.optimization_engines import DynamicsTrajOptConfig, dynamics_trajopt
+
+    cfg = DynamicsTrajOptConfig(n_iters=n_iters)  # stock: early_stop=True, hard flags
+
+    def forward_solver(x0, cost_fn):
+        return dynamics_trajopt(x0, cost_fn, cfg)
+
+    return forward_solver
+
+
+# Bucket wall discretisation.  The recorder builds the bucket as `n_walls`
+# boxes on a circle; iosp's clearance is sphere-based, so the wall becomes a
+# ring of spheres of the wall's own half-thickness, stacked up its height.
+# 12 x 3 = 36 spheres is enough to close the ring at this radius (the angular
+# gap between sphere centres is ~0.036 m at r = 0.0655, well under a sphere
+# diameter) without making the soft-min reduction expensive.
+BUCKET_RING_AZIMUTHS = 12
+BUCKET_RING_LEVELS = 3
+
+
+def bucket_spheres(center, inner_radius, wall_height, wall_thickness):
+    """Bucket wall -> `(M, 4)` xyz+radius collision spheres, batched over scenes.
+
+    `center` is `(..., 3)` with z at the table top; the returned array carries
+    the same leading batch dimensions.  Returns None if the geometry is absent,
+    which is what every synthetic scene does.
+    """
+    if center is None or inner_radius is None:
+        return None
+    A, L = BUCKET_RING_AZIMUTHS, BUCKET_RING_LEVELS
+    th = jnp.linspace(0.0, 2.0 * jnp.pi, A, endpoint=False)          # (A,)
+    frac = jnp.arange(1, L + 1) / L                                   # (L,)
+
+    r_w = 0.5 * (wall_thickness[..., 0] if wall_thickness is not None
+                 else jnp.full(inner_radius[..., 0].shape, 0.01))
+    r_ring = inner_radius[..., 0] + r_w                               # (...,)
+    h = wall_height[..., 0] if wall_height is not None else jnp.full(r_ring.shape, 0.12)
+
+    # Everything to (..., L, A) explicitly: the level and azimuth axes broadcast
+    # against different trailing dims, so relying on implicit rules here silently
+    # produced (..., 1, A) for x/y against (..., L, A) for z.
+    cos_t, sin_t = jnp.cos(th)[None, :], jnp.sin(th)[None, :]         # (1, A)
+    x = center[..., None, None, 0] + r_ring[..., None, None] * cos_t
+    y = center[..., None, None, 1] + r_ring[..., None, None] * sin_t
+    z = center[..., None, None, 2] + h[..., None, None] * frac[:, None]
+    shape = jnp.broadcast_shapes(x.shape, y.shape, z.shape)
+    x, y, z = (jnp.broadcast_to(v, shape) for v in (x, y, z))
+    rad = jnp.broadcast_to(r_w[..., None, None], shape)
+
+    out = jnp.stack([x, y, z, rad], axis=-1)
+    return out.reshape(*out.shape[:-3], L * A, 4)
+
+
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
 class PickPlaceScene:
@@ -344,6 +505,24 @@ class PickPlaceScene:
     # working unchanged.  None is a valid pytree leaf-less node, so `jax.vmap`
     # and `jax.tree.map` over a scene simply skip it.
     pick_yaw: jnp.ndarray = None  # (1,) or None
+
+    # -- the real world, from the recorded scene ----------------------------
+    # All None on every synthetic scene, which reproduces the old
+    # single-placeholder-sphere world exactly.  See
+    # `iosp_scene_fields` in sim_teleop for why these had to start being
+    # emitted: the placeholder sphere sits in the transport corridor and the
+    # demos penetrate it, while the table and bucket -- the only things the
+    # operator actually avoided -- were not in the world at all.
+    table_box: jnp.ndarray = None  # (6,) [c_xyz, half_xyz] of the table
+    # (4,) demonstrated seconds per phase, in PHASES order.  The waypoint export
+    # resamples each phase to a fixed row count, so this is the ONLY place the
+    # demonstration's timing survives -- and it is what makes the `time` feature
+    # identifiable rather than gauge.  See `iosp.fit.teleop`'s duration term.
+    phase_durations: jnp.ndarray = None
+    bucket_center: jnp.ndarray = None  # (3,) xy of the bucket axis, z at the table
+    bucket_inner_radius: jnp.ndarray = None  # (1,)
+    bucket_wall_height: jnp.ndarray = None  # (1,)
+    bucket_wall_thickness: jnp.ndarray = None  # (1,)
 
     # The ANCHORED grasp: orientation and seed taken from the demonstration
     # rather than predicted from the scene.  Both optional, both None on every
@@ -529,13 +708,17 @@ class PickPlaceProblem:
         teleop fit passes the FR3's hand frame -- see `iosp.model.fr3`."""
         kw = {} if ee_link is None else {"ee_link": ee_link}
         base = RobotProblem.load(urdf_path, srdf_path, mesh_dir, n_timesteps=2, **kw)
-        seg = {p: dataclasses.replace(base, n_timesteps=SEGMENT_LEN[p]) for p in PHASES}
+        # `n_aux=1` is the segment's log-duration; see `RobotProblem.n_aux`.
+        seg = {p: dataclasses.replace(base, n_timesteps=SEGMENT_LEN[p], n_aux=1,
+                                      duration_nominal=DURATION_NOMINAL[p])
+               for p in PHASES}
         # The stage-3 refine problem shares the same robot/collision model and
         # differs only in n_timesteps, exactly as the segments do.  Keyed
         # "full" in the same dict rather than a separate field so nothing that
         # iterates `seg` over PHASES sees a change.
         seg["full"] = dataclasses.replace(
-            base, n_timesteps=N_FULL,
+            base, n_timesteps=N_FULL, n_aux=1,
+            duration_nominal=sum(DURATION_NOMINAL.values()),
             pinned_rows=(tuple((i, "q_pick") for i in SKELETON_PICK)
                          + tuple((i, "q_goal") for i in SKELETON_PLACE)))
         return PickPlaceProblem(base=base, seg=seg)
@@ -682,20 +865,51 @@ class PickPlaceProblem:
     # -- per-segment trajopt (reuses ioc.robot.problem.RobotProblem/Scene) -
 
     def segment_residual_fn(self, phase):
+        """The tied `STANDARD_FEATURES` basis, evaluated on one segment."""
         problem = self.seg[phase]
-        features = SEGMENT_FEATURES[phase]
+        return self._standard_residual_fn(problem)
+
+    def _standard_residual_fn(self, problem):
+        """`(x_flat, scene) -> tuple` of the six standard-basis residuals.
+
+        Every derivative is taken with respect to the segment's OWN duration,
+        read out of `x_flat`'s auxiliary tail, so shortening the motion really
+        does raise the acceleration/jerk/effort terms.  With a fixed `dt` the
+        `time` feature would be a constant and its weight pure gauge.
+        """
 
         def residual_fn(x_flat, scene: Scene):
             q = problem.unpack(x_flat, scene)
-            parts = []
-            if "smooth" in features:
-                parts.append((q[2:] - 2.0 * q[1:-1] + q[:-2]).reshape(-1))
-            if "clearance" in features:
-                parts.append(problem.clearance_residual(q, scene))
-            if "upright" in features:
-                quat = problem.robot.forward_kinematics(q)[..., problem.ee_index, 0:4]
-                parts.append(quat[:, 1:3].reshape(-1))  # x,y ~ tilt, see old docstring
-            return tuple(parts)
+            T = problem.duration(x_flat)
+            dt = problem.dt(x_flat)
+
+            # time: the duration itself.  A residual, so the cost is w * T^2 --
+            # monotone in T, which is all a min-time term has to be.
+            r_time = jnp.atleast_1d(T)
+
+            # path: EE arc length, as per-step Cartesian increments.  Geometric,
+            # independent of T, and structurally unrelated to the joint-space
+            # derivatives below (see the basis comment on collinearity).
+            p_ee = problem.ee_positions(q)  # (T, 3)
+            r_path = (p_ee[1:] - p_ee[:-1]).reshape(-1)
+
+            # accel / jerk: finite differences scaled by the real dt.
+            qdd = (q[2:] - 2.0 * q[1:-1] + q[:-2]) / (dt ** 2)
+            r_accel = qdd.reshape(-1)
+            qddd = (q[3:] - 3.0 * q[2:-1] + 3.0 * q[1:-2] - q[:-3]) / (dt ** 3)
+            r_jerk = qddd.reshape(-1)
+
+            # effort: RNEA torque at the interior knots.  Gravity makes this
+            # posture-dependent and therefore NOT a rescaled `accel` -- that
+            # gravity term is the part that carries information a pure
+            # smoothness basis cannot express.
+            qd = (q[2:] - q[:-2]) / (2.0 * dt)
+            tau = problem.robot.inverse_dynamics(q[1:-1], qd, qdd, gravity=-9.81,
+                                                 use_cuda=True)
+            r_effort = tau.reshape(-1)
+
+            r_clear = problem.clearance_residual(q, scene)
+            return (r_time, r_path, r_accel, r_jerk, r_effort, r_clear)
 
         return residual_fn
 
@@ -707,6 +921,50 @@ class PickPlaceProblem:
         # jitter seed -- same reasoning as `RobotProblem.calibrate`'s docstring
         # (must not calibrate on the exactly-zero-acceleration straight line).
         return residual_fn, self.seg[phase]
+
+    def upright_constraint_fn(self, phase):
+        """A HARD grasp-maintenance constraint for `phase`, as a theta-independent
+        AL equality term for `ioc.inner.make_inner_solver`'s `constraints_fn`.
+
+        The residual forces the gripper's TOOL AXIS to stay vertical (yaw about
+        world z is free, so a yawed grasp is fine; only tipping the approach axis
+        off vertical -- which spills the object -- is forbidden).  As a hard
+        constraint this keeps the carried object seated REGARDLESS of the fitted
+        cost weights, which the soft floor could not.
+
+        NOTE the residual is NOT the soft `upright` feature's `quat[1:3]`: that
+        term's zero is not the down orientation (a straight-down gripper is
+        `DOWN_WXYZ=[0,1,0,0]`, whose `quat[1:3]=[1,0]`), so as a weak cost it is a
+        harmless regularizer dominated by the fixed down endpoints, but as a HARD
+        equality it forces the gripper AWAY from vertical and the arm contorts (a
+        run doing exactly that flung the cube off the table, 0/10).  The correct,
+        yaw-free measure is the world-frame xy-components of the EE approach axis
+        R(quat)@[0,0,1] = [2(xz+wy), 2(yz-wx)], which is zero for every down(+yaw)
+        grasp and nonzero exactly when the tool tips off vertical.
+
+        Interior waypoints only (`q[1:-1]`): the endpoints are the fixed IK
+        boundary conditions, so an equality on them would be a constant residual
+        the AL dual could only chase.  Theta-independent by construction, so the
+        implicit adjoint linearizes the augmented stationarity with frozen
+        multipliers -- see `ioc.inner`."""
+        from pyroffi.optimization_engines._trajopt_core import AugmentedLagrangianTerm
+
+        problem = self.seg[phase]
+
+        def constraints_fn(scene):
+            def residual_fn(x_flat):
+                q = problem.unpack(x_flat, scene)
+                quat = problem.robot.forward_kinematics(q)[..., problem.ee_index, 0:4]
+                w, x, y, z = quat[1:-1, 0], quat[1:-1, 1], quat[1:-1, 2], quat[1:-1, 3]
+                # world xy of the EE approach axis R(quat)@[0,0,1]; zero <=> vertical
+                axis_xy = jnp.stack([2.0 * (x * z + w * y),
+                                     2.0 * (y * z - w * x)], axis=-1)
+                return axis_xy.reshape(-1)
+
+            return (AugmentedLagrangianTerm(residual_fn=residual_fn, kind="eq",
+                                            name=f"{phase}.upright_hold"),)
+
+        return constraints_fn
 
     def calibrate_segment(self, phase, residual_fn, scenes: Scene, key, n_probe=16, jitter=0.15):
         problem = self.seg[phase]
@@ -728,34 +986,27 @@ class PickPlaceProblem:
 
     # -- the tied cost model -------------------------------------------------
 
-    def _feature_residuals(self, problem, q, scene, features, upright_span=None):
-        """The shared feature vocabulary, evaluated on any stage's path.
+    def _feature_residuals(self, problem, q, scene, dt, T):
+        """`STANDARD_FEATURES`, evaluated on any stage's path, in basis order.
 
-        One implementation for both stages, so "the same preference applied at
+        One implementation for every stage, so "the same preference applied at
         both levels" is literally the same code and not two definitions that
-        could drift apart.  `upright_span` restricts the tilt feature to a
-        window (the transport phase, within the full path); None means the
-        whole path.
+        could drift apart.  `dt`/`T` come from the caller's own decision vector
+        (`problem.dt`/`problem.duration`) rather than a module constant, which is
+        what lets `time` mean anything -- see `RobotProblem.n_aux`.
         """
-        out = []
-        if "smooth" in features:
-            out.append((q[2:] - 2.0 * q[1:-1] + q[:-2]).reshape(-1))
-        if "clearance" in features:
-            out.append(problem.clearance_residual(q, scene))
-        if "upright" in features:
-            quat = problem.robot.forward_kinematics(q)[..., problem.ee_index, 0:4]
-            lo, hi = (0, q.shape[0]) if upright_span is None else upright_span
-            out.append(quat[lo:hi, 1:3].reshape(-1))
-        if "torque" in features:
-            # GRiD RNEA torque at interior knots (dynamic-effort feature); see
-            # iosp.model.tetris._torque_residual / ioc.robot.bases.dynamic.
-            dt, g = 0.1, -9.81
-            qd = (q[2:] - q[:-2]) / (2.0 * dt)
-            qdd = (q[2:] - 2.0 * q[1:-1] + q[:-2]) / (dt ** 2)
-            tau = problem.robot.inverse_dynamics(q[1:-1], qd, qdd, gravity=g,
-                                                 use_cuda=True)
-            out.append(tau.reshape(-1))
-        return out
+        p_ee = problem.ee_positions(q)
+        qdd = (q[2:] - 2.0 * q[1:-1] + q[:-2]) / (dt ** 2)
+        qd = (q[2:] - q[:-2]) / (2.0 * dt)
+        return [
+            jnp.atleast_1d(T),
+            (p_ee[1:] - p_ee[:-1]).reshape(-1),
+            qdd.reshape(-1),
+            ((q[3:] - 3.0 * q[2:-1] + 3.0 * q[1:-2] - q[:-3]) / (dt ** 3)).reshape(-1),
+            problem.robot.inverse_dynamics(q[1:-1], qd, qdd, gravity=-9.81,
+                                           use_cuda=True).reshape(-1),
+            problem.clearance_residual(q, scene),
+        ]
 
     def shared_segment_residual_fn(self, phase):
         """Stage-2 residuals under the tied model: every segment carries the
@@ -772,7 +1023,9 @@ class PickPlaceProblem:
 
         def residual_fn(x_flat, scene: Scene):
             q = problem.unpack(x_flat, scene)
-            return tuple(self._feature_residuals(problem, q, scene, SHARED_FEATURES))
+            return tuple(self._feature_residuals(problem, q, scene,
+                                                 problem.dt(x_flat),
+                                                 problem.duration(x_flat)))
 
         return residual_fn
 
@@ -786,8 +1039,9 @@ class PickPlaceProblem:
 
         def residual_fn(x_flat, scene: FullScene):
             q = problem.unpack(x_flat, scene)
-            parts = self._feature_residuals(problem, q, scene, SHARED_FEATURES,
-                                            upright_span=span)
+            parts = self._feature_residuals(problem, q, scene,
+                                            problem.dt(x_flat),
+                                            problem.duration(x_flat))
             skel = [q[i] - scene.q_pick for i in SKELETON_PICK]
             skel += [q[i] - scene.q_goal for i in SKELETON_PLACE]
             parts.append(jnp.concatenate(skel))
@@ -835,14 +1089,13 @@ class PickPlaceProblem:
 
         def residual_fn(x_flat, scene: FullScene):
             q = problem.unpack(x_flat, scene)
-            smooth = (q[2:] - 2.0 * q[1:-1] + q[:-2]).reshape(-1)
-            clearance = problem.clearance_residual(q, scene)
-            quat = problem.robot.forward_kinematics(q)[..., problem.ee_index, 0:4]
-            upright = quat[t0:t1, 1:3].reshape(-1)
+            parts = self._feature_residuals(problem, q, scene,
+                                            problem.dt(x_flat),
+                                            problem.duration(x_flat))
             skel = [q[i] - scene.q_pick for i in SKELETON_PICK]
             skel += [q[i] - scene.q_goal for i in SKELETON_PLACE]
-            skeleton = jnp.concatenate(skel)
-            return (smooth, clearance, upright, skeleton)
+            parts.append(jnp.concatenate(skel))
+            return tuple(parts)
 
         return residual_fn
 
@@ -925,11 +1178,16 @@ class PickPlaceProblem:
         q_pick = self.grasp_ik(theta_ik, scenes)
         q_place = self.place_ik(theta_ik, scenes, q_pick)
 
+        _world = self.world_of(scenes)
         phase_scenes = {
-            "approach": Scene(scenes.q_start, q_pick, scenes.obs_center, scenes.obs_radius),
-            "grasp": Scene(q_pick, q_pick, scenes.obs_center, scenes.obs_radius),
-            "transport": Scene(q_pick, q_place, scenes.obs_center, scenes.obs_radius),
-            "place": Scene(q_place, q_place, scenes.obs_center, scenes.obs_radius),
+            "approach": Scene(scenes.q_start, q_pick, scenes.obs_center,
+                              scenes.obs_radius, **_world),
+            "grasp": Scene(q_pick, q_pick, scenes.obs_center,
+                           scenes.obs_radius, **_world),
+            "transport": Scene(q_pick, q_place, scenes.obs_center,
+                               scenes.obs_radius, **_world),
+            "place": Scene(q_place, q_place, scenes.obs_center,
+                           scenes.obs_radius, **_world),
         }
         xs = {}
         for phase in PHASES:
@@ -976,11 +1234,16 @@ class PickPlaceProblem:
         """
         q_pick = self.grasp_ik(theta_ik, scenes)
         q_place = self.place_ik(theta_ik, scenes, q_pick)
+        _world = self.world_of(scenes)
         phase_scenes = {
-            "approach": Scene(scenes.q_start, q_pick, scenes.obs_center, scenes.obs_radius),
-            "grasp": Scene(q_pick, q_pick, scenes.obs_center, scenes.obs_radius),
-            "transport": Scene(q_pick, q_place, scenes.obs_center, scenes.obs_radius),
-            "place": Scene(q_place, q_place, scenes.obs_center, scenes.obs_radius),
+            "approach": Scene(scenes.q_start, q_pick, scenes.obs_center,
+                              scenes.obs_radius, **_world),
+            "grasp": Scene(q_pick, q_pick, scenes.obs_center,
+                           scenes.obs_radius, **_world),
+            "transport": Scene(q_pick, q_place, scenes.obs_center,
+                               scenes.obs_radius, **_world),
+            "place": Scene(q_place, q_place, scenes.obs_center,
+                           scenes.obs_radius, **_world),
         }
         xs = {}
         for phase in PHASES:
@@ -1079,17 +1342,37 @@ class PickPlaceProblem:
         """
         return self.ee_positions(self.full_joint_paths(scenes, xs, phase_scenes))
 
+    @staticmethod
+    def world_of(scenes: PickPlaceScene):
+        """`Scene`'s optional world fields for these scenes, as kwargs.
+
+        Empty on a synthetic scene (no table/bucket recorded), which leaves the
+        collision world exactly the single placeholder sphere it has always been.
+        """
+        return dict(
+            obs_spheres=bucket_spheres(scenes.bucket_center,
+                                       scenes.bucket_inner_radius,
+                                       scenes.bucket_wall_height,
+                                       scenes.bucket_wall_thickness),
+            table_box=scenes.table_box,
+        )
+
     def seeds(self, scenes: PickPlaceScene, theta_ik, forward_solver_free=None):
         """Interior-waypoint seeds per phase, from the SAME IK call used by the
         differentiable forward path (not a separate disconnected precompute --
         see module docstring / the old design's `seed_ik` this replaces)."""
         q_pick = self.grasp_ik(theta_ik, scenes)
         q_place = self.place_ik(theta_ik, scenes, q_pick)
+        world = self.world_of(scenes)
         phase_scenes = {
-            "approach": Scene(scenes.q_start, q_pick, scenes.obs_center, scenes.obs_radius),
-            "grasp": Scene(q_pick, q_pick, scenes.obs_center, scenes.obs_radius),
-            "transport": Scene(q_pick, q_place, scenes.obs_center, scenes.obs_radius),
-            "place": Scene(q_place, q_place, scenes.obs_center, scenes.obs_radius),
+            "approach": Scene(scenes.q_start, q_pick, scenes.obs_center,
+                              scenes.obs_radius, **world),
+            "grasp": Scene(q_pick, q_pick, scenes.obs_center,
+                           scenes.obs_radius, **world),
+            "transport": Scene(q_pick, q_place, scenes.obs_center,
+                               scenes.obs_radius, **world),
+            "place": Scene(q_place, q_place, scenes.obs_center,
+                           scenes.obs_radius, **world),
         }
         x0 = {p: jax.vmap(self.seg[p].seed)(phase_scenes[p]) for p in PHASES}
         return x0, phase_scenes, q_pick, q_place

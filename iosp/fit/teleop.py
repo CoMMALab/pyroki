@@ -74,6 +74,7 @@ roughly 0.07/sqrt(23) ~ 0.015 m in EE terms before anything else contributes.
 """
 
 import dataclasses
+import json
 import os
 import pathlib
 import sys
@@ -216,8 +217,53 @@ def measure_standoffs(prob, demo_q, scenes, idx):
     return np.array([grasp_z, place_z, rad, tan], dtype=np.float32)
 
 
+def release_offset_cap(demo_dir=DEFAULT_DEMO_DIR, idx=None, margin=0.005):
+    """Largest in-plane release offset (m) that still drops the cube INSIDE the
+    bucket, over episodes `idx` -- read from each episode's own randomisation
+    record, not tuned.
+
+    MEASURED, and the reason this exists: `measure_standoffs` returns the
+    coordinate-wise MEDIAN of the operators' release offsets, which on this set
+    is `|offset| = 0.0719 m`.  Every episode's bucket is smaller than that
+    (`bucket_inner_radius` is randomised, ~0.0655 m; the cube is 0.015 m
+    half-extent), so the median release point lies OUTSIDE the bucket and
+    pinning the event to it fails the task 0/10 (dxy 71 mm, dz +134 mm -- the
+    cube lands on the rim) even though it fits the demonstrations best.  The
+    median of a correlated distribution need not be a feasible member of it:
+    the operators who reached farther released lower, and taking each coordinate's
+    median independently combines them into a drop nobody performed.
+
+    So the release offset is PROJECTED into the feasible disc.  `min` over the
+    episodes, not mean: a single small bucket makes a larger offset infeasible
+    for that scene, and the pinned event is global.
+    """
+    eps = find_episodes(demo_dir)
+    if idx is not None:
+        eps = [eps[i] for i in np.asarray(idx)]
+    caps = []
+    for d in eps:
+        with open(d / "factors.json") as fh:
+            f = json.load(fh)
+        caps.append(float(f["bucket_inner_radius"]) - float(f["cube_half_extent"]))
+    return max(0.0, min(caps) - margin)
+
+
+def project_release_offset(standoffs, cap):
+    """`standoffs` with its (radial, tangential) pair shrunk to at most `cap`,
+    keeping the demonstrated DIRECTION.  Under the cap it is a no-op."""
+    s = np.asarray(standoffs, dtype=np.float32).copy()
+    r = float(np.hypot(s[2], s[3]))
+    if r > cap and r > 0.0:
+        s[2] *= cap / r
+        s[3] *= cap / r
+    return s
+
+
 def build_teleop(demo_dir=DEFAULT_DEMO_DIR, teleop_root=DEFAULT_TELEOP_ROOT,
-                 n_fit=None, seed=0, n_iters=60, n_restarts=1, space="joint"):
+                 n_fit=None, seed=0, n_iters=600, n_restarts=1, space="joint",
+                 fast_forward=True, freeze_ik=False, ee_weight=0.0,
+                 pin_ik=None, upright_floor=0.0, free_space_only=False,
+                 hard_upright=(), duration_weight=1.0):
     """The `built` dict `iosp.fit.procedure.run_procedure` consumes.
 
     `space` defaults to "joint", not "ee" as in `build_parametric`: the
@@ -236,6 +282,16 @@ def build_teleop(demo_dir=DEFAULT_DEMO_DIR, teleop_root=DEFAULT_TELEOP_ROOT,
     if space not in ("ee", "joint"):
         raise ValueError(f"space must be 'ee' or 'joint', got {space!r}")
 
+    # `n_iters` DEFAULTS TO 600, not the 60 the old two-feature basis used.
+    # MEASURED on the standard basis: worst inner stationarity is 9.1e-2 at 60
+    # iterations, 7.7e-3 at 200 and 9.5e-4 at 600, i.e. the 1e-3 tolerance is
+    # first met at 600.  That tolerance is not cosmetic -- `ioc.inner`'s implicit
+    # adjoint is only valid at a converged solve, so every gradient and every
+    # Gram spectrum taken below 600 here is meaningless rather than merely noisy
+    # (see `screen_stationarity`).  The basis is simply harder than the old one:
+    # RNEA effort residuals are O(1e3-1e4) against O(1e-2) for path, and the
+    # duration scalar sits among 42 waypoint variables with very different
+    # curvature.  The forward solve costs ~10x accordingly.
     names, demo_q, scenes = load_demos(demo_dir, teleop_root)
     B = len(names)
     n_fit = B - max(1, B // 4) if n_fit is None else int(n_fit)
@@ -246,7 +302,13 @@ def build_teleop(demo_dir=DEFAULT_DEMO_DIR, teleop_root=DEFAULT_TELEOP_ROOT,
 
     urdf, srdf, mesh_dir, ee_link = fr3.paths()
     prob = pp.PickPlaceProblem.load(urdf, srdf, mesh_dir, ee_link=ee_link)
-    forward_solver = pp.make_composed_forward_solver(n_iters=n_iters)
+    # `fast_forward` (default) finds x* with the stock early-stopping solver:
+    # the implicit adjoint is analytic and forward-independent (ioc.inner), so
+    # this cuts the forward-compile of `loss`/`gf` and every path readout without
+    # changing the adjoint's correctness -- only `unrolled`, which differentiates
+    # through the solver, needs the soft map and builds its own.
+    forward_solver = (pp.make_stock_forward_solver(n_iters=n_iters) if fast_forward
+                      else pp.make_composed_forward_solver(n_iters=n_iters))
 
     K = pp.K_IK + pp.K_TRAJOPT
     standoffs = measure_standoffs(prob, demo_q, scenes, fit_idx)
@@ -260,16 +322,135 @@ def build_teleop(demo_dir=DEFAULT_DEMO_DIR, teleop_root=DEFAULT_TELEOP_ROOT,
     # reason `build_parametric` calibrates on scene A only: a scale fitted on
     # the held-out scenes lets them re-normalise the very features being tested.
     fit_scenes = jax.tree.map(lambda a: a[fit_idx], scenes)
+    # `hard_upright` phases get a HARD (AL) grasp-maintenance constraint instead
+    # of relying on the fitted/floored soft `upright` weight -- the gripper axis
+    # stays vertical through those phases regardless of the cost weights, so an
+    # aggressive fitter that zeroes upright can no longer tip the carried object
+    # out.  See `pp.PickPlaceProblem.upright_constraint_fn`.
+    constraints_by_phase = ({p: prob.upright_constraint_fn(p) for p in hard_upright}
+                            if hard_upright else None)
+    if hard_upright:
+        print(f"  [teleop] HARD grasp-maintenance (upright AL constraint) on: "
+              f"{list(hard_upright)}", flush=True)
     inner, _ = _build_inner(prob, fit_scenes, z_of(jnp.zeros(K))[: pp.K_IK],
-                            forward_solver, seed, n_restarts=n_restarts)
+                            forward_solver, seed, n_restarts=n_restarts,
+                            constraints_by_phase=constraints_by_phase)
+
+    # `freeze_ik` holds theta_ik at the measured standoff prior and fits only
+    # theta_trajopt.  theta_ik is measured geometry (median offsets read off the
+    # demos by `measure_standoffs`), not a preference; letting the joint-RMSE fit
+    # retune it walks the release off the bucket (place.radial ran to -0.15 m,
+    # 0/10 rollout success) while init at the prior succeeds 10/10.  Freezing it
+    # keeps the events physically right by construction, so the recovered object
+    # is purely the free-space cost preference -- which is the IOSP claim.  The
+    # first K_IK components of u then have zero effect (dead dims for CMA-ES,
+    # zero gradient for the differentiable methods); K is left at 11 so every
+    # downstream shape/name is unchanged.
+    theta_ik_frozen = P[: pp.K_IK]
+
+    # -- the PRINCIPLED decomposition: task events -> constraints, free-space ->
+    # fitted cost.  A pick-and-place demonstration IDENTIFIES its skeleton (grasp
+    # the cube, release into the bucket, keep the object seated in transit); only
+    # the free-space motion between events is a latent PREFERENCE.  Fitting the
+    # skeleton as a cost is fitting known quantities as if unknown, which is what
+    # corrupted them (place.radial -> -0.15 m; transport.upright -> 0).  So:
+    #
+    #   pin_ik="bucket"   release event pinned to the TASK GOAL (bucket CENTRE at
+    #                     the measured drop height, radial=tangential=0), grasp at
+    #                     the cube -- the symbolic goal, not the demo's own
+    #                     marginally-inside release.  This is the release-event
+    #                     constraint: q_place = IK(target) is a hard boundary of
+    #                     the transport solve, so pinning the target pins the event.
+    #   pin_ik="measured" release pinned to the demo's measured offsets (the old
+    #                     `freeze_ik`); kept for comparison.
+    #   upright_floor>0   grasp-retention constraint: a floor on transport.upright
+    #                     so the fit cannot trade away keeping the gripper level
+    #                     (upright is the proxy for "don't tip/lose the grasp"
+    #                     during the carry).  A soft constraint (fixed floor),
+    #                     deliberately not the AL machinery, which has been
+    #                     ill-conditioned/inert on this model.
+    #   free_space_only   fit the preference on the FREE-SPACE rows only; the
+    #                     event rows are determined by the constraints above, so
+    #                     scoring them just dilutes the preference signal.
+    #
+    # ROLLOUT SUCCESS IS NEVER IN THIS LOSS -- it is verification only.
+    # `upright` left the cost basis (see `pickplace.STANDARD_FEATURES`): keeping
+    # the gripper level during the carry is grasp RETENTION, a task requirement,
+    # and it now lives only in `upright_constraint_fn`'s hard constraint. So
+    # there is no weight left to floor. `upright_floor` is accepted and ignored,
+    # with a warning, rather than removed, so existing command lines and scripts
+    # still run instead of dying on an unknown argument.
+    if upright_floor > 0.0:
+        print(f"  [teleop] NOTE: --upright-floor {upright_floor} ignored; "
+              "`upright` is no longer a fitted weight. Use hard_upright=(...) "
+              "for grasp retention.", flush=True)
+        upright_floor = 0.0
+    EVENT_ROWS = sorted(set(pp.SKELETON_PICK) | set(pp.SKELETON_PLACE))
+    FREE_ROWS = jnp.asarray([r for r in range(pp.N_FULL) if r not in EVENT_ROWS])
+    theta_ik_bucket = jnp.asarray(
+        [standoffs[0], standoffs[1], 0.0, 0.0], dtype=jnp.float32)
+    if pin_ik == "bucket":
+        theta_ik_pinned = theta_ik_bucket
+    elif pin_ik == "feasible":
+        # The demonstrated release, PROJECTED into the bucket -- the middle
+        # ground between "bucket" (task-safe, but discards the measured near-rim
+        # release and freezes 0.23 m of place error no weight can touch) and
+        # "measured" (fits best, drops the cube on the rim, 0/10).  MEASURED
+        # over the offset ray at the fitted weights: |offset| 0.000 -> loss
+        # 0.679 / EE 0.155 / 8-8 success; 0.054 -> 0.493 / 0.138 / 8-8;
+        # 0.072 (the raw median) -> 0.456 / 0.134 / 0-8.  The success cliff sits
+        # exactly at the disc `release_offset_cap` computes, so the projection
+        # buys the reconstruction without spending the task.
+        cap = release_offset_cap(demo_dir, fit_idx)
+        theta_ik_pinned = jnp.asarray(project_release_offset(standoffs, cap),
+                                      dtype=jnp.float32)
+        print(f"  [teleop] release offset capped at {cap:.4f} m "
+              f"(measured |offset| {float(np.hypot(standoffs[2], standoffs[3])):.4f} m) "
+              f"-> radial {float(theta_ik_pinned[2]):+.4f}, "
+              f"tangential {float(theta_ik_pinned[3]):+.4f}", flush=True)
+    elif pin_ik == "measured" or freeze_ik:
+        theta_ik_pinned = theta_ik_frozen
+    else:
+        theta_ik_pinned = None
+
+    def _weights(z_traj):
+        w = jax.nn.softmax(z_traj)
+        if False:  # upright_floor: retired with the `upright` weight
+            # RENORMALIZED.  The previous version raised the upright entry in
+            # place and left the rest alone, so the weights no longer summed to
+            # 1 and the floor was an ABSOLUTE weight no amount of fitting could
+            # outrank: at the uniform init it sat at 0.25 against ~0.09 for
+            # every other feature, and the only way any method could reduce it
+            # was to drive one smoothness logit to the simplex corner and swamp
+            # it (measured: that is exactly and only what CMA-ES found).  Worse,
+            # a constant entry has zero gradient through the softmax except via
+            # the denominator, so the floored coordinate's gradient collapsed to
+            # the generic value shared by every inert feature -- the fit could
+            # not see the term it was being forced to pay.  Rescaling the
+            # remaining mass keeps the floor a genuine lower bound on a SHARE
+            # while leaving the simplex intact.
+            w = w.at[UPRIGHT_IDX].set(jnp.maximum(w[UPRIGHT_IDX], upright_floor))
+            others = jnp.delete(jnp.arange(w.shape[0]), UPRIGHT_IDX,
+                                assume_unique_indices=True)
+            rest = w[others]
+            w = w.at[others].set(rest * (1.0 - w[UPRIGHT_IDX])
+                                 / jnp.maximum(rest.sum(), 1e-12))
+        return w
 
     def _rollout(u):
         z = z_of(u)
-        theta_ik, z_traj = z[: pp.K_IK], z[pp.K_IK:]
+        theta_ik = theta_ik_pinned if theta_ik_pinned is not None else z[: pp.K_IK]
+        z_traj = z[pp.K_IK:]
         x0, _, _, _ = prob.seeds(scenes, theta_ik)
-        _, _, xs, ps = prob.solve(theta_ik, _split_trajopt(jax.nn.softmax(z_traj)),
+        _, _, xs, ps = prob.solve(theta_ik, _split_trajopt(_weights(z_traj)),
                                   scenes, inner, x0)
         return xs, ps
+
+    def _durations(xs):
+        """(B, 4) fitted seconds per phase, read out of each segment's own
+        decision vector.  See `RobotProblem.duration`."""
+        return jnp.stack([jax.vmap(prob.seg[p].duration)(xs[p]) for p in pp.PHASES],
+                         axis=-1)
 
     def ee_paths(u):
         xs, ps = _rollout(u)
@@ -283,6 +464,16 @@ def build_teleop(demo_dir=DEFAULT_DEMO_DIR, teleop_root=DEFAULT_TELEOP_ROOT,
     paths_j = jax.jit(paths)
     ee_paths_j = jax.jit(ee_paths)
 
+    demo_dur = getattr(scenes, "phase_durations", None)
+    if demo_dur is None:
+        print("  [teleop] NOTE: episodes carry no `phase_durations`; the `time` "
+              "feature has no data to fit against and will be gauge.", flush=True)
+    else:
+        _d = np.asarray(demo_dur)
+        print(f"  [teleop] demo phase durations, s (mean over {B} episodes): "
+              + ", ".join(f"{p} {v:.2f}" for p, v in zip(pp.PHASES, _d.mean(0))),
+              flush=True)
+
     demo = demo_q if space == "joint" else jax.vmap(prob.ee_positions)(demo_q)
     ee_demo = jax.vmap(prob.ee_positions)(demo_q)
 
@@ -291,14 +482,47 @@ def build_teleop(demo_dir=DEFAULT_DEMO_DIR, teleop_root=DEFAULT_TELEOP_ROOT,
                         "teleop (path A, human demos)")
 
     def loss_a(u):
-        return jnp.mean(jnp.sum((paths(u)[fit_idx] - demo[fit_idx]) ** 2, axis=-1))
+        # Base term in the loss `space` (joint by default: preserves the
+        # redundant arm's homotopy/elbow branch, which an EE loss is blind to).
+        # `ee_weight > 0` adds a Cartesian alignment term from the SAME rollout,
+        # so the object's placement is pulled toward the (successful) demo EE
+        # path even as the joint term pins the branch -- the hypothesis being
+        # that joint keeps the arm on the right route while EE keeps the hand
+        # (and thus the cube/bucket) where the task needs it.  Units differ
+        # (rad^2 vs m^2 per waypoint), so `ee_weight` is a relative scale, not 1.
+        xs, ps = _rollout(u)
+        base_paths = (prob.full_joint_paths(scenes, xs, ps) if space == "joint"
+                      else prob.full_ee_paths(scenes, xs, ps))
+        rows = FREE_ROWS if free_space_only else slice(None)
+        loss = jnp.mean(jnp.sum(
+            (base_paths[fit_idx][:, rows] - demo[fit_idx][:, rows]) ** 2, axis=-1))
+        # DURATION term.  The waypoint export resamples each phase to a fixed row
+        # count, so `base_paths` contains no timing at all: two episodes, one
+        # twice as fast, give identical matrices.  Without this term the `time`
+        # feature is pure gauge -- it can only reach the loss through how the
+        # dt-scaled accel/jerk/effort terms rebalance the SHAPE, which is a very
+        # weak channel.  Scored as a RELATIVE error so seconds^2 does not have to
+        # be commensurate with rad^2, and only where the demo recorded it.
+        if duration_weight and demo_dur is not None:
+            # `grasp` excluded: its recorded duration is one sample by
+            # construction of the skeleton cuts, not a measurement.
+            ti = jnp.asarray([pp.PHASES.index(p) for p in pp.TIMED_PHASES])
+            T_fit = _durations(xs)[fit_idx][:, ti]
+            T_dem = demo_dur[fit_idx][:, ti]
+            loss = loss + duration_weight * jnp.mean(((T_fit - T_dem) / T_dem) ** 2)
+        if ee_weight and space == "joint":
+            ee = prob.ee_positions(base_paths)
+            loss = loss + ee_weight * jnp.mean(jnp.sum(
+                (ee[fit_idx][:, rows] - ee_demo[fit_idx][:, rows]) ** 2, axis=-1))
+        return loss
 
     def _rmse(P_, D, idx):
         return float(jnp.sqrt(jnp.mean(jnp.sum((P_[idx] - D[idx]) ** 2, axis=-1))))
 
     def theta_of(u):
         z = np.asarray(z_of(u))
-        return np.concatenate([z[: pp.K_IK], np.asarray(jax.nn.softmax(z[pp.K_IK:]))])
+        ik = np.asarray(theta_ik_pinned) if theta_ik_pinned is not None else z[: pp.K_IK]
+        return np.concatenate([ik, np.asarray(_weights(jnp.asarray(z[pp.K_IK:])))])
 
     return dict(
         gf=jax.jit(jax.value_and_grad(loss_a)),
@@ -315,6 +539,8 @@ def build_teleop(demo_dir=DEFAULT_DEMO_DIR, teleop_root=DEFAULT_TELEOP_ROOT,
         rmse_b=lambda u: _rmse(paths_j(u), demo, gen_idx),
         ee_rmse_a=lambda u: _rmse(ee_paths_j(u), ee_demo, fit_idx),
         ee_rmse_b=lambda u: _rmse(ee_paths_j(u), ee_demo, gen_idx),
+        durations_fn=jax.jit(lambda u: _durations(_rollout(u)[0])),
+        demo_durations=demo_dur,
         K=K, n_ik=pp.K_IK, theta_of=theta_of, standoff_prior=standoffs,
         # No ground-truth cost exists for a human demonstrator: `run_procedure`
         # skips every parameter-space metric on `theta_star is None`.

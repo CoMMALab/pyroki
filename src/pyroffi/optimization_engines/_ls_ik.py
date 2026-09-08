@@ -984,8 +984,8 @@ def ls_ik_solve_cuda(
         # pose but not clearance, so it must see the identical geometry.
         collision_buffers=(robot_spheres_local, robot_sphere_joint_idx,
                            world_spheres, world_capsules, world_boxes,
-                           world_halfspaces, self_sph_local, self_link_start,
-                           self_link_joint, self_pair_i, self_pair_j),
+                           world_halfspaces, _sc[0], _sc[1],
+                           _sc[2], _sc[3], _sc[4]),
         # The caller's requested standoff, not a hardcoded one: canonicalisation
         # walked to 1 mm clearance under a requested 0.02 m margin, respecting
         # its own guard while silently breaking the solver's contract.

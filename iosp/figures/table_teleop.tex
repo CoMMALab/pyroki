@@ -1,0 +1,25 @@
+% Human teleop reconstruction (E10): FR3 + GELLO, 10 episodes (8 fit / 2 held-out),
+% composed pick-place planner, multistart 4 branches x 3 starts, 40 steps, fusion-on/chunk=2.
+% theta/param metrics are undefined for human demos; the behavioural EE criterion is reported.
+\begin{table}[t]
+  \centering
+  \caption{Recovery from human teleoperated pick-and-place (E10). Two seeds of
+  the $4{\times}3$-candidate multistart on 10 FR3 episodes (8 fit, 2 held-out).
+  End-effector RMSE is the reported criterion; $\mathrm{fit}\approx\mathrm{held}$
+  indicates no overfitting gap. The held-out RMSE spread is over the 12
+  candidates, showing the multistart selecting the good basin against worse ones.}
+  \label{tab:teleop}
+  \begin{tabular}{lcccccc}
+    \toprule
+     & \multicolumn{2}{c}{EE RMSE (m)} & \multicolumn{2}{c}{winner loss-space}
+       & held.\ spread & summed-loss \\
+    \cmidrule(lr){2-3}\cmidrule(lr){4-5}
+    seed & fit & held-out & train & held-out & (max/min) & drop \\
+    \midrule
+    0 & 0.134 & 0.125 & 0.635 & 0.542 & $5.5\times$ & $40.4\%$ \\
+    1 & 0.157 & 0.144 & 0.656 & 0.548 & $2.6\times$ & $39.3\%$ \\
+    \midrule
+    mean & 0.146 & 0.135 & 0.645 & 0.545 & --- & $39.9\%$ \\
+    \bottomrule
+  \end{tabular}
+\end{table}

@@ -1,0 +1,99 @@
+{
+  "description": "Static collision benchmark environment for panda, filtered from bench_env_large.json to drop obstacles inside fixed (non-actuated) links.",
+  "floor": {
+    "point": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "normal": [
+      0.0,
+      0.0,
+      1.0
+    ]
+  },
+  "spheres": [
+    {
+      "name": "center_obs",
+      "center": [
+        0.5017634034156799,
+        -2.465190328815662e-32,
+        0.5
+      ],
+      "radius": 0.1
+    },
+    {
+      "name": "left_obs",
+      "center": [
+        0.2,
+        0.4,
+        0.4
+      ],
+      "radius": 0.08
+    },
+    {
+      "name": "right_obs",
+      "center": [
+        0.3,
+        -0.3,
+        0.6
+      ],
+      "radius": 0.08
+    },
+    {
+      "name": "sphere_3",
+      "center": [
+        -0.2706831097602844,
+        0.0,
+        0.33062049746513367
+      ],
+      "radius": 0.08
+    },
+    {
+      "name": "sphere_4",
+      "center": [
+        -0.14632336795330048,
+        -0.31709083914756775,
+        0.10270083695650101
+      ],
+      "radius": 0.08
+    },
+    {
+      "name": "sphere_5",
+      "center": [
+        -0.07238509505987167,
+        0.24805839359760284,
+        0.5468919277191162
+      ],
+      "radius": 0.08
+    },
+    {
+      "name": "sphere_6",
+      "center": [
+        0.39016082882881165,
+        -1.232595164407831e-32,
+        -0.006271268706768751
+      ],
+      "radius": 0.08
+    },
+    {
+      "name": "sphere_7",
+      "center": [
+        -0.015211007557809353,
+        0.27055513858795166,
+        0.1447310894727707
+      ],
+      "radius": 0.08
+    },
+    {
+      "name": "sphere_8",
+      "center": [
+        0.135170578956604,
+        -0.20846006274223328,
+        0.38272786140441895
+      ],
+      "radius": 0.08
+    }
+  ],
+  "cuboids": []
+}

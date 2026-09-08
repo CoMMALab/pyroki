@@ -79,8 +79,13 @@ def enable_compilation_cache():
 # releases on the bucket's axis, so every recorded synthetic result is
 # reproduced byte-for-byte by the widened parameter vector.
 THETA_IK_STAR = jnp.array([0.06, 0.04, 0.0, 0.0], dtype=jnp.float32)
-Z_TRAJOPT_STAR = jnp.array([1.0, 2.0, 0.5, 1.0, 2.0, 0.5, 1.0], dtype=jnp.float32)
-Z_FULL_STAR = jnp.array([1.0, 2.0, 0.5, 1.5], dtype=jnp.float32)  # refine: smooth, clearance, upright, skeleton
+# The tied STANDARD_FEATURES basis: time, path, accel, jerk, effort, clearance.
+# Was 7 per-phase entries (approach/grasp/transport/place x {smooth, clearance,
+# upright}); the basis is now one shared 6-vector -- see
+# `iosp.model.pickplace.STANDARD_FEATURES`.
+Z_TRAJOPT_STAR = jnp.array([0.5, 1.0, 2.0, 0.5, 1.0, 2.0], dtype=jnp.float32)
+# refine: time, path, accel, jerk, effort, clearance, skeleton
+Z_FULL_STAR = jnp.array([0.5, 1.0, 2.0, 0.5, 1.0, 2.0, 1.5], dtype=jnp.float32)
 
 # -- the canonical task ------------------------------------------------------
 Q_START = jnp.array([0.0, -0.6, 0.0, -2.2, 0.0, 1.6, 0.8], dtype=jnp.float32)

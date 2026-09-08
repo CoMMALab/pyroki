@@ -1,121 +1,82 @@
 """Benchmark and correctness evaluation of IK solvers: pyroffi (this work) vs baselines.
 
 Methods
-    pyroffi (this work)
-        HJCD-IK, LS-IK, SQP-IK, MPPI-IK, Analytic-IK — each with a JAX (differentiable,
-        GPU) backend and a CUDA/FFI kernel backend.  Learned-IK (JAX, Flax MLP warm-start
-        + LM refinement).
-    Baselines
-        cuRobo IK (NV LAb LBM-optimized IK, its own conda env, see below).
-        PyRoKi-LS and PyRoKi-AnalyticJac (jaxls LM; "AnalyticJac" uses the analytic
-        task-space Jacobian in the residual, not a closed-form solver).
-        QuIK-CPU (Halley's-method CPU IK).
+    pyroffi:    HJCD/LS/SQP/MPPI/Analytic-IK, each with a JAX backend and a CUDA/FFI
+                kernel backend. Learned-IK (Flax MLP warm-start + LM refinement, JAX only).
+    Baselines:  cuRobo (own conda env, see below), PyRoKi-LS / PyRoKi-AnalyticJac
+                (jaxls LM; "AnalyticJac" swaps in the analytic task-space Jacobian),
+                QuIK-CPU (Halley's-method CPU IK).
 
-Sequential (per-problem) timing
-    Every solver is evaluated one pose at a time to measure single-problem
-    latency.  JAX/CUDA pyroffi solvers are timed with JIT device timers inside a
-    fixed-count lax.scan (no Python dispatch in the timed loop); cuRobo is timed
-    with CUDA events; PyRoKi and QuIK with wall clocks.
-
-Batch timing
-    Batch solvers are timed over N_TARGETS_BATCH targets at once to measure
-    throughput.  The effective per-problem time is total_time / N_TARGETS_BATCH.
+Timing
+    Sequential: one pose at a time, for single-problem latency. pyroffi solvers use
+    JIT device timers inside a fixed-count lax.scan (no Python dispatch in the timed
+    loop); cuRobo uses CUDA events; PyRoKi/QuIK use wall clocks.
+    Batch: N_TARGETS_BATCH targets at once, for throughput; effective per-problem
+    time = total_time / N_TARGETS_BATCH.
 
 Correctness
-    For each solver the median position / rotation errors across all target
-    poses are reported, and success is counted against a single common
-    threshold (POS_THR_M = 1 mm, ROT_THR_RAD = 0.05 rad) for every method.
-    (cuRobo's solver internally targets its native 5 mm tolerance; the success
-    column is nevertheless scored with the same 1 mm / 0.05 rad metric.)
+    Median position/rotation error is reported per solver; success is scored
+    against one shared threshold (POS_THR_M / ROT_THR_RAD) for every method, even
+    though cuRobo's own solver targets a looser native 5 mm tolerance internally.
 
 Collision-free IK
-    When COLLISION_FREE=True a static obstacle scene is created (or loaded from
-    ENV_FILE) and each differentiable solver is re-run with the same soft
-    collision penalty in its objective.  Results include a coll_free column
-    showing how many solutions are actually collision-free (min signed distance
-    > 0).  cuRobo uses its own world-collision-aware IK; its rows are scored
-    with the same success thresholds and its coll_free_n comes from its own
-    self/world-collision check.  Analytic-IK is excluded from the collision
-    rows: its CUDA collision handling is candidate *selection* over a closed-form
-    branch set, not the differentiable penalty that all other collision rows use,
-    so including it would not be an apples-to-apples comparison.
-
-    The scene is saved to ENV_FILE as JSON with a ``curobo_world_model`` key
-    that can be fed directly into a cuRobo WorldConfig for fair comparison.
+    When COLLISION_FREE=True, each differentiable solver is re-run with a soft
+    collision penalty in its objective against a scene loaded from/saved to
+    ENV_FILE (JSON, with a ``curobo_world_model`` key cuRobo can load directly).
+    coll_free_n counts solutions with min signed distance > 0; cuRobo instead
+    reports its own world-collision-aware feasibility check. Analytic-IK is
+    excluded from these rows: its CUDA path does candidate *selection* over
+    closed-form branches, not the differentiable penalty the other rows use.
 
 Learned-IK
-    The Learned-IK solver requires a pre-trained Flax model.  Train one with:
-        python train_learned_ik.py --robot panda
-    The model is saved to resources/learned_ik/panda.pkl and loaded
-    automatically.  If no model is found the learned-IK rows are skipped.
+    Needs a pre-trained Flax model: `python train_learned_ik.py --robot panda`
+    (saved to resources/learned_ik/panda.pkl). Rows are skipped if none is found.
 
-Usage:
+Usage
     python tests/bench_ik.py
 
-    Every solver is benchmarked in its OWN subprocess (one per robot x solver), so
-    no solver's JAX preallocation, GLASS-tier cache, JIT/kernel compilation or
-    allocator state can perturb another's timings. The top-level process is a thin
-    dispatcher that never touches the GPU; the ``--robot``/``--solver`` flags mark
-    the isolated child invocations and are not meant to be passed by hand.
+    Every solver runs in its OWN subprocess (one per robot x solver) so JAX
+    preallocation, GLASS-tier caching, JIT/kernel compilation, and allocator state
+    from one solver can't perturb another's timing. The top-level process is a
+    thin dispatcher that never touches the GPU; --robot/--solver mark the isolated
+    child invocations and aren't meant to be passed by hand.
 
     Fairness / reproducibility notes:
-      * All target poses are generated from a fixed seed-0 RNG in the pyroffi env
-        and every method is given the exact same targets.  For cuRobo the targets
-        are dumped to an .npz sidecar and its child (which runs in a separate
-        conda env) consumes that file, so nothing is re-sampled or re-derived.
-      * All pyroffi and PyRoKi solvers use num_seeds = 32 random restarts.
-        cuRobo is also given num_seeds = 32 (its own benchmark ships with 2/8);
-        the seed budget is therefore documented per method.
-      * Analytic-IK children run with JAX_ENABLE_X64=1 (set pre-import) because
-        the closed-form solve and its CUDA FFI require float64; all other
-        children run in the default (float32) dtype.
+      * Targets: fixed seed-0 RNG, identical across every method. cuRobo's child
+        (separate conda env) reads them from an .npz sidecar instead of resampling.
+      * num_seeds = 32 for every method, including cuRobo (its own benchmark ships
+        with 2/8 by default).
+      * Analytic-IK children set JAX_ENABLE_X64=1 pre-import (the closed-form
+        solve + its CUDA FFI need float64); every other child stays float32.
       * cuRobo runs in its own conda env (``curobo``, editable install of
-        baselines/curobo).  The dispatcher locates the interpreter via the
-        CUROBO_PYTHON env var, a sibling "curobo" conda env, or
-        ``conda run -n curobo``.  cuRobo only ships robot configs for panda
-        (franka.yml) and g1 (unitree_g1.yml); fetch/baxter cuRobo rows are
-        skipped with a logged note.  The per-robot tool frame is narrowed
-        in-memory before the solver is built (panda → panda_hand, g1 →
-        right_hand_palm_link, which is present in unitree_g1.yml's kinematics),
-        so cuRobo goals and the error comparison happen in the same frame as
-        the pyroffi targets — no static offset is needed.
-      * GPU monitoring (NVML) respects CUDA_VISIBLE_DEVICES: with
-        CUDA_VISIBLE_DEVICES=k the monitor watches physical GPU k, so the
-        reported util/VRAM rows always belong to the GPU the child actually ran
-        on.
-      * MPPI's L-BFGS refinement budget is identical (25 iterations) on the JAX
-        and CUDA backends.
+        baselines/curobo), located via CUROBO_PYTHON, a sibling "curobo" env, or
+        `conda run -n curobo`. It only ships configs for panda/g1; fetch/baxter
+        rows are skipped with a logged note. Its tool frame is narrowed in-memory
+        to match pyroffi's EE link (panda_hand / right_hand_palm_link) before the
+        solver is built, so goals and errors compare in the same frame.
+      * GPU monitoring (NVML) tracks the physical GPU named by
+        CUDA_VISIBLE_DEVICES, so util/VRAM rows match the GPU the child ran on.
+      * MPPI's L-BFGS refinement budget (25 iters) is identical on JAX and CUDA.
 
-Prerequisites:
+Prerequisites
     1. A CUDA-capable GPU.
-    2. CUDA libraries compiled:
-           bash build_kernels/build_hjcd_ik_cuda.sh
-           bash build_kernels/build_ls_ik_cuda.sh
-           bash build_kernels/build_sqp_ik_cuda.sh
-           bash build_kernels/build_mppi_ik_cuda.sh
-    3. robot_descriptions installed:
-           pip install robot_descriptions
-    4. (Optional) Flax model for Learned-IK:
-           pip install flax optax
-           python train_learned_ik.py --robot panda
-    5. (Optional) cuRobo baseline: a conda env ``curobo`` with an editable
-       install of baselines/curobo (or CUROBO_PYTHON pointing at its python).
+    2. Built CUDA kernels: bash build_kernels/build_{hjcd,ls,sqp,mppi}_ik_cuda.sh
+    3. pip install robot_descriptions
+    4. (Optional, Learned-IK) pip install flax optax; then train_learned_ik.py
+    5. (Optional, cuRobo) a `curobo` conda env with baselines/curobo installed,
+       or CUROBO_PYTHON pointing at its python.
 """
 
 from __future__ import annotations
 
 import argparse
-import contextlib
-import csv
 import datetime
 import functools
 import json
 import os
 import pathlib
-import shutil
 import subprocess
 import sys
-import threading
 import time
 from dataclasses import dataclass
 
@@ -139,149 +100,142 @@ _NO_JAX = _CPU_ONLY or "--no-jax" in sys.argv[1:]
 # one at a time and each get the full card with the default (preallocating)
 # allocator, so their timings are not perturbed by any co-resident solver.
 _IS_SOLVER_CHILD = "--solver" in sys.argv[1:]
-if not _CPU_ONLY and not _IS_SOLVER_CHILD:
-    os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
-# Analytic-IK (closed-form) children run in float64: the 7-DOF branch solve and
-# its CUDA FFI kernel both require x64, while every other child keeps the
-# default dtype so JAX/CUDA agreement is measured under the same precision.
-# JAX reads JAX_ENABLE_X64 at import, so this must land before ``import jax``.
-if "--solver" in sys.argv[1:]:
-    _solver_idx = sys.argv.index("--solver")
-    if _solver_idx + 1 < len(sys.argv) and sys.argv[_solver_idx + 1] in (
-        "Analytic-JAX", "Analytic-CUDA",
-    ):
-        os.environ["JAX_ENABLE_X64"] = "1"
-
-import jax
-import jax.numpy as jnp
-import jaxlie
-import numpy as np
-import pyroffi as pk
-import yourdfpy
-
-from pyroffi.collision import Box, RobotCollisionSpherized, Sphere, collide
-from pyroffi._robot_srdf_parser import read_disabled_collisions_from_srdf
-
-# Optional NVML for GPU monitoring (nvidia-ml-py / pynvml).
-# NVML indices are PHYSICAL, so the handle must track CUDA_VISIBLE_DEVICES —
-# otherwise a child pinned to GPU k would report GPU 0's util/VRAM.
-try:
-    if _CPU_ONLY:
-        raise RuntimeError("CPU-only mode")
-    import pynvml as _pynvml
-    _pynvml.nvmlInit()
-    _cve = os.environ.get("CUDA_VISIBLE_DEVICES", "")
-    _cve_idx = int(_cve.split(",")[0].strip()) if _cve.strip() else 0
-    _NVML_HANDLE: object | None = _pynvml.nvmlDeviceGetHandleByIndex(_cve_idx)
-    _NVML_OK = True
-except Exception:
-    _NVML_HANDLE = None
-    _NVML_OK = False
-
-
-@contextlib.contextmanager
-def _gpu_monitor(interval_s: float = 0.02):
-    """Sample GPU utilisation and VRAM in a background thread.
-
-    Yields a dict; on exit the dict contains:
-        ``gpu_util``  – list of utilisation % samples
-        ``vram_mb``   – list of used VRAM (MiB) samples
-    """
-    samples: dict[str, list[float]] = {"gpu_util": [], "vram_mb": []}
-    stop_evt = threading.Event()
-
-    def _sample() -> None:
-        while not stop_evt.is_set():
-            if _NVML_OK and _NVML_HANDLE is not None:
-                util = _pynvml.nvmlDeviceGetUtilizationRates(_NVML_HANDLE)
-                mem  = _pynvml.nvmlDeviceGetMemoryInfo(_NVML_HANDLE)
-                samples["gpu_util"].append(float(util.gpu))
-                samples["vram_mb"].append(float(mem.used) / 1024 ** 2)
-            stop_evt.wait(interval_s)
-
-    t = threading.Thread(target=_sample, daemon=True)
-    t.start()
-    try:
-        yield samples
-    finally:
-        stop_evt.set()
-        t.join(timeout=1.0)
-
-from pyroffi.optimization_engines._hjcd_ik import hjcd_solve
-from pyroffi.optimization_engines._ls_ik import ls_ik_solve
-from pyroffi.optimization_engines._sqp_ik import sqp_ik_solve
-from pyroffi.optimization_engines._mppi_ik import mppi_ik_solve
-
-if not _CPU_ONLY:
-    from pyroffi.optimization_engines._hjcd_ik import (
-        hjcd_solve_cuda,
-        hjcd_solve_cuda_batch,
-    )
-    from pyroffi.optimization_engines._ls_ik import (
-        ls_ik_solve_cuda,
-        ls_ik_solve_cuda_batch,
-    )
-    from pyroffi.optimization_engines._sqp_ik import (
-        sqp_ik_solve_cuda,
-        sqp_ik_solve_cuda_batch,
-    )
-    from pyroffi.optimization_engines._mppi_ik import (
-        mppi_ik_solve_cuda,
-        mppi_ik_solve_cuda_batch,
-    )
-
-# Analytic (closed-form) IK for the 7-DOF spherical-wrist family.  The JAX
-# backend is pure JAX (available in CPU-only mode too); the CUDA/FFI backend
-# needs a GPU and float64 (see the pre-import JAX_ENABLE_X64 flag above).
-from pyroffi.kinematics._analytic_ik import (
-    analytic_ik_solve,
-    analytic_ik_solve_batched,
-    build_geometry,
+# cuRobo is the one solver whose child runs in a SEPARATE conda env (see
+# _curobo_python_cmd / _run_solver_subprocess) that has neither JAX nor
+# pyroffi installed. Its child re-invokes this SAME file (for a single CSV
+# schema / constants), so every JAX- and pyroffi-dependent import below (and
+# the VRAM/x64 preamble, which only makes sense for a JAX process) must be
+# skipped for that child — see _run_curobo_child, which does its own
+# (deferred, function-local) torch/curobo imports instead.
+_IS_CUROBO_CHILD = (
+    _IS_SOLVER_CHILD
+    and sys.argv[sys.argv.index("--solver") + 1] == "cuRobo"
 )
 
-if not _CPU_ONLY:
-    from pyroffi.optimization_engines._analytic_ik import (
-        analytic_ik_solve_cuda,
-        analytic_ik_solve_cuda_batch,
+import numpy as np
+
+from bench_ik_utils import (
+    POS_THR_M,
+    ROT_THR_RAD,
+    _batch_row,
+    _batch_row_coll,
+    _CSV_FIELDS,
+    _curobo_python_cmd,
+    _CUROBO_ROBOT_FILES,
+    _gpu_monitor,
+    _NVML_OK,
+    _run_curobo_child,
+    _seq_row,
+    _seq_row_coll,
+    _table_header,
+    _table_row,
+    _table_sep,
+    _write_csv,
+)
+
+if not _IS_CUROBO_CHILD:
+    if not _CPU_ONLY and not _IS_SOLVER_CHILD:
+        os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+
+    # Analytic-IK (closed-form) children run in float64: the 7-DOF branch solve
+    # and its CUDA FFI kernel both require x64, while every other child keeps
+    # the default dtype so JAX/CUDA agreement is measured under the same
+    # precision. JAX reads JAX_ENABLE_X64 at import, so this must land before
+    # ``import jax``.
+    if "--solver" in sys.argv[1:]:
+        _solver_idx = sys.argv.index("--solver")
+        if _solver_idx + 1 < len(sys.argv) and sys.argv[_solver_idx + 1] in (
+            "Analytic-JAX", "Analytic-CUDA",
+        ):
+            os.environ["JAX_ENABLE_X64"] = "1"
+
+    import jax
+    import jax.numpy as jnp
+    import jaxlie
+    import pyroffi as pk
+    import yourdfpy
+
+    from pyroffi.collision import Box, RobotCollisionSpherized, Sphere, collide
+    from pyroffi._robot_srdf_parser import read_disabled_collisions_from_srdf
+
+    from pyroffi.optimization_engines._hjcd_ik import hjcd_solve
+    from pyroffi.optimization_engines._ls_ik import ls_ik_solve
+    from pyroffi.optimization_engines._sqp_ik import sqp_ik_solve
+    from pyroffi.optimization_engines._mppi_ik import mppi_ik_solve
+
+    if not _CPU_ONLY:
+        from pyroffi.optimization_engines._hjcd_ik import (
+            hjcd_solve_cuda,
+            hjcd_solve_cuda_batch,
+        )
+        from pyroffi.optimization_engines._ls_ik import (
+            ls_ik_solve_cuda,
+            ls_ik_solve_cuda_batch,
+        )
+        from pyroffi.optimization_engines._sqp_ik import (
+            sqp_ik_solve_cuda,
+            sqp_ik_solve_cuda_batch,
+        )
+        from pyroffi.optimization_engines._mppi_ik import (
+            mppi_ik_solve_cuda,
+            mppi_ik_solve_cuda_batch,
+        )
+
+    # Analytic (closed-form) IK for the 7-DOF spherical-wrist family.  The JAX
+    # backend is pure JAX (available in CPU-only mode too); the CUDA/FFI
+    # backend needs a GPU and float64 (see the pre-import JAX_ENABLE_X64 flag
+    # above).
+    from pyroffi.kinematics._analytic_ik import (
+        analytic_ik_solve,
+        analytic_ik_solve_batched,
+        build_geometry,
     )
 
-# QuIK CPU (Halley's-method) IK backend (optional; needs cricket JIT + a
-# DH-representable serial chain).  It always runs on the CPU, so it is timed
-# here as the CPU alternative to the CUDA solvers.
-try:
-    from pyroffi.optimization_engines._quik_ik import QuIKSolver
-    _QUIK_IMPORT_OK = True
-except Exception:
-    _QUIK_IMPORT_OK = False
+    if not _CPU_ONLY:
+        from pyroffi.optimization_engines._analytic_ik import (
+            analytic_ik_solve_cuda,
+            analytic_ik_solve_cuda_batch,
+        )
 
-# VAMP CPU collision checker + MPPI collision-free projection kernel (optional;
-# needs cricket JIT).  Used to give QuIK a collision-aware mode: seeds are
-# projected onto the collision-free manifold and solutions collision-filtered.
-try:
-    from pyroffi.collision import VAMPCPUCollisionChecker
-    _VAMP_CPU_IMPORT_OK = True
-except Exception:
-    _VAMP_CPU_IMPORT_OK = False
+    # QuIK CPU (Halley's-method) IK backend (optional; needs cricket JIT + a
+    # DH-representable serial chain).  It always runs on the CPU, so it is
+    # timed here as the CPU alternative to the CUDA solvers.
+    try:
+        from pyroffi.optimization_engines._quik_ik import QuIKSolver
+        _QUIK_IMPORT_OK = True
+    except Exception:
+        _QUIK_IMPORT_OK = False
 
-# Learned-IK: imports only; model is loaded inside main() after the robot is known.
-try:
-    from pyroffi.optimization_engines._learned_ik import (
-        get_default_model_path,
-        load_learned_ik,
-        make_learned_ik_solve,
-    )
-    _LEARNED_IK_IMPORT_OK = True
-except Exception:
-    _LEARNED_IK_IMPORT_OK = False
+    # VAMP CPU collision checker + MPPI collision-free projection kernel
+    # (optional; needs cricket JIT).  Used to give QuIK a collision-aware
+    # mode: seeds are projected onto the collision-free manifold and
+    # solutions collision-filtered.
+    try:
+        from pyroffi.collision import VAMPCPUCollisionChecker
+        _VAMP_CPU_IMPORT_OK = True
+    except Exception:
+        _VAMP_CPU_IMPORT_OK = False
 
-# PyRoKi IK solver (optional).
-try:
-    import pyroki as _pyroki
-    import jaxls as _jaxls
-    _PYROKI_AVAILABLE = True
-except Exception:
-    _PYROKI_AVAILABLE = False
+    # Learned-IK: imports only; model is loaded inside main() after the robot
+    # is known.
+    try:
+        from pyroffi.optimization_engines._learned_ik import (
+            get_default_model_path,
+            load_learned_ik,
+            make_learned_ik_solve,
+        )
+        _LEARNED_IK_IMPORT_OK = True
+    except Exception:
+        _LEARNED_IK_IMPORT_OK = False
+
+    # PyRoKi IK solver (optional).
+    try:
+        import pyroki as _pyroki
+        import jaxls as _jaxls
+        _PYROKI_AVAILABLE = True
+    except Exception:
+        _PYROKI_AVAILABLE = False
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -289,34 +243,26 @@ except Exception:
 
 ROBOT_NAMES = ("panda", "fetch", "baxter", "g1")
 
-# GLASS parallelism tier per robot, passed to the CUDA IK kernels via the
-# PYROFFI_IK_TIER env var (see src/pyroffi/cuda_kernels/_tier_kernel.cuh).
-# The tier is cached process-globally on first CUDA kernel launch; since every
-# solver already runs in its own subprocess (see main()), the tier for a robot's
-# CUDA-solver children is set from this table. g1 is omitted: at 43 DOF it
-# exceeds TIER_CHOICE_MAX_N (32) and PYROFFI_TIER_DISPATCH forces Tier::Block
-# regardless of this env var.
+# GLASS parallelism tier per robot, set via PYROFFI_IK_TIER for CUDA IK kernels
+# (cached process-globally on first launch, hence per-subprocess). Assignment
+# is by actuated DOF: thread for <=8 DOF (panda=7, fetch=8), warp for medium/
+# bimanual (baxter=14), block for high-DOF (g1=43 — also forced regardless,
+# since DOF > TIER_CHOICE_MAX_N locks the kernels to Tier::Block anyway).
 ROBOT_TIER = {
     "panda":  "thread",
-    "fetch":  "warp",
-    "baxter": "block",
+    "fetch":  "thread",
+    "baxter": "warp",
+    "g1":     "block",
 }
 
-# The four core IK methods, each with a JAX and a CUDA backend. Everything in the
-# benchmark keys off these base solver labels (see _candidate_solvers / --solver).
-_CORE_METHODS = ("HJCD", "LS", "SQP", "MPPI")
+_CORE_METHODS = ("HJCD", "LS", "SQP", "MPPI")  # each has a JAX + CUDA backend
 
-# Robots whose 7-DOF arm chain supports the closed-form (Analytic-IK) solve.
-# build_geometry() validates the family at runtime; this set keeps the dispatcher
-# from spawning children that would immediately skip.
+# Robots with a 7-DOF spherical-wrist chain, needed for the closed-form
+# Analytic-IK solve (build_geometry() validates this at runtime too).
 _ANALYTIC_ROBOTS = frozenset(("panda", "fetch", "baxter"))
 
-# cuRobo ships robot configs only for these two; the value is cuRobo's robot file
-# name.  The cuRobo child narrows each config's tool_frames to pyroffi's EE link
-# in-memory (panda_hand; right_hand_palm_link for g1, which is present in
-# unitree_g1.yml's kinematics), so no static offset is needed.  fetch/baxter
-# cuRobo rows are skipped with a logged note (see main()).
-_CUROBO_ROBOT_FILES = {"panda": "franka.yml", "g1": "unitree_g1.yml"}
+# cuRobo ships configs only for these two (_CUROBO_ROBOT_FILES, from
+# bench_ik_utils); fetch/baxter cuRobo rows are skipped with a logged note.
 
 
 def _candidate_solvers(
@@ -489,9 +435,8 @@ IK_KWARGS_ANALYTIC_CUDA = dict(
     num_seeds = 32,
 )
 
-# Success threshold.
-POS_THR_M   = 1e-3
-ROT_THR_RAD = 0.05
+# Success thresholds (POS_THR_M, ROT_THR_RAD) live in bench_ik_utils, shared
+# with the cuRobo child's scoring.
 
 # ---------------------------------------------------------------------------
 # Collision-free IK configuration
@@ -554,7 +499,6 @@ def _pose_errors(
         (target_pose.rotation().inverse() @ actual.rotation()).log()
     ))
     return pos_err, rot_err
-
 
 
 def _run_solver_sequential(
@@ -675,120 +619,8 @@ def _run_solver_batch(
 # ---------------------------------------------------------------------------
 # Summary helpers
 # ---------------------------------------------------------------------------
-
-_COL_W = 20  # method name column width
-_NUM_W = 10  # numeric column width
-
-def _table_header(cols: list[str]) -> str:
-    row = f"  {'Method':<{_COL_W}}"
-    for c in cols:
-        row += f"  {c:>{_NUM_W}}"
-    return row
-
-def _table_sep(n_cols: int) -> str:
-    return "  " + "-" * (_COL_W + n_cols * (_NUM_W + 2))
-
-def _table_row(label: str, vals: list[str]) -> str:
-    row = f"  {label:<{_COL_W}}"
-    for v in vals:
-        row += f"  {v:>{_NUM_W}}"
-    return row
-
-
-def _seq_row(label: str, results: list[SolveResult]) -> tuple[str, dict]:
-    pos    = np.array([r.pos_err * 1e3 for r in results])
-    rot    = np.array([r.rot_err       for r in results])
-    t      = np.array([r.time_ms       for r in results])
-    solved = sum(r.pos_err < POS_THR_M and r.rot_err < ROT_THR_RAD for r in results)
-    n      = len(results)
-    vals = [
-        f"{np.median(t):.3f}",
-        f"{np.percentile(t, 95):.3f}",
-        f"{np.median(pos):.4f}",
-        f"{np.percentile(pos, 95):.4f}",
-        f"{np.median(rot):.4f}",
-        f"{np.percentile(rot, 95):.4f}",
-        f"{solved}/{n}",
-    ]
-    return _table_row(label, vals), {"t_med": float(np.median(t))}
-
-
-def _seq_row_coll(
-    label: str, results: list[SolveResult], coll_free: int,
-) -> tuple[str, dict]:
-    """Like _seq_row but with an extra coll_free column."""
-    pos    = np.array([r.pos_err * 1e3 for r in results])
-    rot    = np.array([r.rot_err       for r in results])
-    t      = np.array([r.time_ms       for r in results])
-    solved = sum(r.pos_err < POS_THR_M and r.rot_err < ROT_THR_RAD for r in results)
-    n      = len(results)
-    vals = [
-        f"{np.median(t):.3f}",
-        f"{np.percentile(t, 95):.3f}",
-        f"{np.median(pos):.4f}",
-        f"{np.percentile(pos, 95):.4f}",
-        f"{np.median(rot):.4f}",
-        f"{np.percentile(rot, 95):.4f}",
-        f"{solved}/{n}",
-        f"{coll_free}/{n}",
-    ]
-    return _table_row(label, vals), {"t_med": float(np.median(t))}
-
-
-def _batch_row(label: str, result: BatchResult) -> tuple[str, dict]:
-    pos    = result.pos_errs * 1e3
-    rot    = result.rot_errs
-    solved = int(np.sum((result.pos_errs < POS_THR_M) & (result.rot_errs < ROT_THR_RAD)))
-    n      = len(pos)
-
-    def _fmt_pct(v: float) -> str:
-        return f"{v:.0f}%" if not np.isnan(v) else "n/a"
-
-    def _fmt_mb(v: float) -> str:
-        return f"{v:.0f}" if not np.isnan(v) else "n/a"
-
-    vals = [
-        f"{result.time_ms:.3f}",
-        f"{np.median(pos):.4f}",
-        f"{np.percentile(pos, 95):.4f}",
-        f"{np.median(rot):.4f}",
-        f"{np.percentile(rot, 95):.4f}",
-        f"{solved}/{n}",
-        _fmt_pct(result.peak_gpu_util),
-        _fmt_pct(result.avg_gpu_util),
-        _fmt_mb(result.peak_vram_mb),
-    ]
-    return _table_row(label, vals), {}
-
-
-def _batch_row_coll(
-    label: str, result: BatchResult, coll_free: int,
-) -> tuple[str, dict]:
-    """Like _batch_row but with an extra coll_free column."""
-    pos    = result.pos_errs * 1e3
-    rot    = result.rot_errs
-    solved = int(np.sum((result.pos_errs < POS_THR_M) & (result.rot_errs < ROT_THR_RAD)))
-    n      = len(pos)
-
-    def _fmt_pct(v: float) -> str:
-        return f"{v:.0f}%" if not np.isnan(v) else "n/a"
-
-    def _fmt_mb(v: float) -> str:
-        return f"{v:.0f}" if not np.isnan(v) else "n/a"
-
-    vals = [
-        f"{result.time_ms:.3f}",
-        f"{np.median(pos):.4f}",
-        f"{np.percentile(pos, 95):.4f}",
-        f"{np.median(rot):.4f}",
-        f"{np.percentile(rot, 95):.4f}",
-        f"{solved}/{n}",
-        f"{coll_free}/{n}",
-        _fmt_pct(result.peak_gpu_util),
-        _fmt_pct(result.avg_gpu_util),
-        _fmt_mb(result.peak_vram_mb),
-    ]
-    return _table_row(label, vals), {}
+# _table_header/_table_sep/_table_row and _seq_row/_seq_row_coll/_batch_row/
+# _batch_row_coll live in bench_ik_utils (pure numpy, no jax dependency).
 
 
 def _make_batched_jax_solver(base_fn, ik_kwargs):
@@ -1468,6 +1300,99 @@ def _default_env_file() -> pathlib.Path:
     return ENV_FILE
 
 
+def robot_env_path(robot_name: str) -> pathlib.Path:
+    """Per-robot obstacle scene path (see _build_robot_env_dict).
+
+    Public (no leading underscore): bench_ik_utils's cuRobo child derives the
+    SAME path independently from robot_name, so this naming convention is a
+    contract between the two files, not a private implementation detail.
+    """
+    return RESOURCE_ROOT / f"bench_env_large_{robot_name}.json"
+
+
+def _immovable_link_names(robot: pk.Robot) -> set[str]:
+    """Links whose pose does NOT depend on any actuated joint (rigid base/torso/
+    pedestal). FK at two different configs and keep the links that didn't move.
+    """
+    n_act = robot.joints.num_actuated_joints
+    lo = np.array(robot.joints.lower_limits)
+    hi = np.array(robot.joints.upper_limits)
+    T_lo = np.asarray(robot.forward_kinematics(jnp.array(lo, dtype=jnp.float32)))
+    T_hi = np.asarray(robot.forward_kinematics(jnp.array(hi, dtype=jnp.float32)))
+    names = robot.links.names
+    diff = np.abs(T_lo - T_hi).reshape(len(names), -1).max(axis=-1)
+    return {names[i] for i in range(len(names)) if diff[i] < 1e-6}
+
+
+def _build_robot_env_dict(robot_name: str, robot: pk.Robot,
+                          robot_coll: RobotCollisionSpherized) -> dict:
+    """Filter the shared obstacle catalogue (ENV_FILE) down to obstacles that
+    don't permanently intersect this robot's FIXED links.
+
+    A rigid base/torso/pedestal isn't reachable by any IK joint, so an obstacle
+    embedded in it makes the "collision-free" objective unsatisfiable for every
+    solver and backend regardless of algorithm — poisoning the collision
+    penalty's gradient/merit contribution with an unwinnable, heavily-weighted
+    term. MEASURED: this is exactly what happened for baxter (base/torso
+    penetrating 4 of the 9 shared obstacles by up to -0.15 m at any config),
+    degrading collision-free pos error from ~1mm (panda) to 300-1600mm across
+    every JAX and CUDA solver alike.
+
+    Result is cached to robot_env_path(robot_name); cuboids currently in the
+    shared catalogue are 0, so only spheres are filtered (cuboid filtering can
+    be added the same way if the catalogue ever grows one).
+    """
+    base_env = json.loads(ENV_FILE.read_text())
+    immovable = _immovable_link_names(robot)
+    if not immovable:
+        return base_env
+
+    n_act = robot.joints.num_actuated_joints
+    coll_geom = robot_coll.at_config(robot, jnp.zeros(n_act, dtype=jnp.float32))
+    centers = np.asarray(coll_geom.pose.translation())  # (n_sph_per_link, n_link, 3)
+    radii = np.asarray(coll_geom.radius)                # (n_sph_per_link, n_link)
+    link_names = robot.links.names
+
+    def _fixed_link_min_dist(center: np.ndarray, radius: float) -> float:
+        best = float("inf")
+        for li, name in enumerate(link_names):
+            if name not in immovable:
+                continue
+            for si in range(centers.shape[0]):
+                r = float(radii[si, li])
+                if r <= 0.0:
+                    continue
+                d = float(np.linalg.norm(centers[si, li] - center)) - r - radius
+                best = min(best, d)
+        return best
+
+    kept, dropped = [], []
+    for s in base_env.get("spheres", []):
+        d = _fixed_link_min_dist(np.array(s["center"], dtype=np.float64), s["radius"])
+        (kept if d > 0.0 else dropped).append(s)
+    if dropped:
+        print(f"  {robot_name}: dropped {len(dropped)} obstacle(s) permanently "
+              f"intersecting a fixed link: {[s['name'] for s in dropped]}")
+
+    env = dict(base_env)
+    env["spheres"] = kept
+    env["description"] = (
+        f"Static collision benchmark environment for {robot_name}, filtered "
+        f"from {ENV_FILE.name} to drop obstacles inside fixed (non-actuated) "
+        f"links."
+    )
+    if "curobo_world_model" in env:
+        kept_names = {s["name"] for s in kept}
+        cwm = dict(env["curobo_world_model"])
+        cwm["sphere"] = {k: v for k, v in cwm.get("sphere", {}).items() if k in kept_names}
+        env["curobo_world_model"] = cwm
+
+    path = robot_env_path(robot_name)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(env, indent=2))
+    return env
+
+
 def _default_srdf_for_robot(robot_name: str) -> pathlib.Path | None:
     """Resolve SRDF path for a robot, preferring explicit mapping then folder scan."""
     mapped = ROBOT_SRDFS.get(robot_name)
@@ -1510,158 +1435,7 @@ def _disabled_pairs_from_srdf(srdf_path: pathlib.Path | None) -> tuple[tuple[str
 # ---------------------------------------------------------------------------
 # CSV output
 # ---------------------------------------------------------------------------
-
-_CSV_FIELDS = [
-    "timestamp", "robot", "mode", "solver", "collision_free",
-    "n_problems", "n_timed",
-    "t_med_ms", "t_p95_ms",
-    "pos_med_mm", "pos_p95_mm",
-    "rot_med_rad", "rot_p95_rad",
-    "success_n", "success_total",
-    "coll_free_n",
-    "peak_gpu_pct", "avg_gpu_pct", "peak_vram_mb",
-]
-
-
-def _write_csv(
-    path: pathlib.Path,
-    timestamp: str,
-    robot_name: str,
-    seq_results: dict[str, list[SolveResult]],
-    batch_results: dict[str, BatchResult],
-    seq_coll_results: dict[str, list[SolveResult]],
-    batch_coll_results: dict[str, BatchResult],
-    seq_coll_free: dict[str, int],
-    batch_coll_free: dict[str, int],
-) -> None:
-    """Append all benchmark results to *path* as CSV rows."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    write_header = not path.exists()
-
-    rows: list[dict] = []
-
-    # -- Sequential (no collision) ------------------------------------------
-    for solver, results in seq_results.items():
-        pos = np.array([r.pos_err * 1e3 for r in results])
-        rot = np.array([r.rot_err       for r in results])
-        t   = np.array([r.time_ms       for r in results])
-        solved = sum(r.pos_err < POS_THR_M and r.rot_err < ROT_THR_RAD for r in results)
-        rows.append({
-            "timestamp":      timestamp,
-            "robot":          robot_name,
-            "mode":           "sequential",
-            "solver":         solver,
-            "collision_free": False,
-            "n_problems":     len(results),
-            "n_timed":        N_TIMED,
-            "t_med_ms":       round(float(np.median(t)),        6),
-            "t_p95_ms":       round(float(np.percentile(t, 95)), 6),
-            "pos_med_mm":     round(float(np.median(pos)),       6),
-            "pos_p95_mm":     round(float(np.percentile(pos, 95)), 6),
-            "rot_med_rad":    round(float(np.median(rot)),       6),
-            "rot_p95_rad":    round(float(np.percentile(rot, 95)), 6),
-            "success_n":      solved,
-            "success_total":  len(results),
-            "coll_free_n":    "",
-            "peak_gpu_pct":   "",
-            "avg_gpu_pct":    "",
-            "peak_vram_mb":   "",
-        })
-
-    # -- Batch (no collision) ------------------------------------------------
-    for solver, result in batch_results.items():
-        pos    = result.pos_errs * 1e3
-        rot    = result.rot_errs
-        solved = int(np.sum((result.pos_errs < POS_THR_M) & (result.rot_errs < ROT_THR_RAD)))
-
-        def _fmtf(v): return round(float(v), 6) if not np.isnan(v) else ""
-
-        rows.append({
-            "timestamp":      timestamp,
-            "robot":          robot_name,
-            "mode":           "batch",
-            "solver":         solver,
-            "collision_free": False,
-            "n_problems":     len(pos),
-            "n_timed":        N_TIMED,
-            "t_med_ms":       round(result.time_ms, 6),
-            "t_p95_ms":       "",
-            "pos_med_mm":     round(float(np.median(pos)),        6),
-            "pos_p95_mm":     round(float(np.percentile(pos, 95)), 6),
-            "rot_med_rad":    round(float(np.median(rot)),         6),
-            "rot_p95_rad":    round(float(np.percentile(rot, 95)), 6),
-            "success_n":      solved,
-            "success_total":  len(pos),
-            "coll_free_n":    "",
-            "peak_gpu_pct":   _fmtf(result.peak_gpu_util),
-            "avg_gpu_pct":    _fmtf(result.avg_gpu_util),
-            "peak_vram_mb":   _fmtf(result.peak_vram_mb),
-        })
-
-    # -- Sequential (collision-free) -----------------------------------------
-    for solver, results in seq_coll_results.items():
-        pos = np.array([r.pos_err * 1e3 for r in results])
-        rot = np.array([r.rot_err       for r in results])
-        t   = np.array([r.time_ms       for r in results])
-        solved = sum(r.pos_err < POS_THR_M and r.rot_err < ROT_THR_RAD for r in results)
-        rows.append({
-            "timestamp":      timestamp,
-            "robot":          robot_name,
-            "mode":           "sequential",
-            "solver":         solver,
-            "collision_free": True,
-            "n_problems":     len(results),
-            "n_timed":        N_TIMED,
-            "t_med_ms":       round(float(np.median(t)),          6),
-            "t_p95_ms":       round(float(np.percentile(t, 95)),  6),
-            "pos_med_mm":     round(float(np.median(pos)),         6),
-            "pos_p95_mm":     round(float(np.percentile(pos, 95)), 6),
-            "rot_med_rad":    round(float(np.median(rot)),         6),
-            "rot_p95_rad":    round(float(np.percentile(rot, 95)), 6),
-            "success_n":      solved,
-            "success_total":  len(results),
-            "coll_free_n":    seq_coll_free.get(solver, ""),
-            "peak_gpu_pct":   "",
-            "avg_gpu_pct":    "",
-            "peak_vram_mb":   "",
-        })
-
-    # -- Batch (collision-free) ----------------------------------------------
-    for solver, result in batch_coll_results.items():
-        pos    = result.pos_errs * 1e3
-        rot    = result.rot_errs
-        solved = int(np.sum((result.pos_errs < POS_THR_M) & (result.rot_errs < ROT_THR_RAD)))
-
-        def _fmtf(v): return round(float(v), 6) if not np.isnan(v) else ""  # noqa: F811
-
-        rows.append({
-            "timestamp":      timestamp,
-            "robot":          robot_name,
-            "mode":           "batch",
-            "solver":         solver,
-            "collision_free": True,
-            "n_problems":     len(pos),
-            "n_timed":        N_TIMED,
-            "t_med_ms":       round(result.time_ms, 6),
-            "t_p95_ms":       "",
-            "pos_med_mm":     round(float(np.median(pos)),         6),
-            "pos_p95_mm":     round(float(np.percentile(pos, 95)), 6),
-            "rot_med_rad":    round(float(np.median(rot)),         6),
-            "rot_p95_rad":    round(float(np.percentile(rot, 95)), 6),
-            "success_n":      solved,
-            "success_total":  len(pos),
-            "coll_free_n":    batch_coll_free.get(solver, ""),
-            "peak_gpu_pct":   _fmtf(result.peak_gpu_util),
-            "avg_gpu_pct":    _fmtf(result.avg_gpu_util),
-            "peak_vram_mb":   _fmtf(result.peak_vram_mb),
-        })
-
-    with path.open("a", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=_CSV_FIELDS)
-        if write_header:
-            writer.writeheader()
-        writer.writerows(rows)
-
+# _CSV_FIELDS / _write_csv live in bench_ik_utils.
 
 # ---------------------------------------------------------------------------
 # Main
@@ -1848,15 +1622,21 @@ def _run_robot_benchmark(
             print(f"  Using SRDF disabled pairs: {srdf_path} ({len(ignore_pairs)} pairs)")
         else:
             print("  SRDF disabled pairs: none")
-        env_file = _default_env_file()
-        if not env_file.exists():
+        shared_env_file = _default_env_file()
+        if not shared_env_file.exists():
             raise FileNotFoundError(
-                f"Environment file not found: {env_file}. "
+                f"Environment file not found: {shared_env_file}. "
                 "Create it once (for example by running this benchmark for panda) "
                 "or point your workflow to an existing bench_env.json."
             )
-        env_dict = json.loads(env_file.read_text())
-        print(f"  Loaded environment from {env_file}")
+        # Filtered per-robot: the shared catalogue was tuned against panda's
+        # small origin-mounted footprint and can sit INSIDE a bigger robot's
+        # fixed base/torso, which no IK joint can ever move out of the way —
+        # see _build_robot_env_dict's docstring.
+        env_dict = _build_robot_env_dict(robot_name, robot, robot_coll)
+        env_file = robot_env_path(robot_name)
+        print(f"  Loaded environment from {shared_env_file}, filtered for "
+              f"{robot_name} -> {env_file}")
 
         _validate_env_dict(env_dict, env_file)
 
@@ -2048,7 +1828,7 @@ def _run_robot_benchmark(
     )  # (N_TARGETS_BATCH, 7)
 
     # Sidecar for the cuRobo child, which runs in a separate conda env and
-    # cannot consume these jaxlie poses directly (see bench_ik_curobo.py).
+    # cannot consume these jaxlie poses directly (see _run_curobo_child).
     # The dump is deterministic (seed-0 targets), so every pyroffi child
     # rewrites the identical file; cuRobo is the LAST candidate solver per
     # robot, so by the time its child starts the file is guaranteed to exist.
@@ -2627,37 +2407,15 @@ def _run_robot_benchmark(
             seq_coll_results, batch_coll_results,
             seq_coll_free if COLLISION_FREE else {},
             batch_coll_free if COLLISION_FREE else {},
+            n_timed=N_TIMED,
         )
         print(f"\nResults appended to {csv_file}")
 
     print()
 
 
-def _curobo_python_cmd() -> list[str] | None:
-    """Locate a python interpreter with cuRobo installed.
-
-    Precedence: the CUROBO_PYTHON env var, a sibling ``curobo`` conda env next
-    to the active one (i.e. ``<envs>/curobo/bin/python``), then
-    ``conda run -n curobo``.  Returns None if no candidate is found.
-    """
-    override = os.environ.get("CUROBO_PYTHON")
-    if override:
-        if pathlib.Path(override).is_file():
-            return [override]
-        print(f"  warning: CUROBO_PYTHON={override} not found; trying other candidates")
-    prefix = os.environ.get("CONDA_PREFIX")
-    if prefix:
-        envs_dir = pathlib.Path(prefix).resolve().parent
-    else:
-        # Not inside a conda env: infer <envs>/ from sys.executable
-        # (<envs>/<env>/bin/python).
-        envs_dir = pathlib.Path(sys.executable).resolve().parent.parent.parent
-    sibling = envs_dir / "curobo" / "bin" / "python"
-    if sibling.is_file():
-        return [str(sibling)]
-    if shutil.which("conda") is not None:
-        return ["conda", "run", "--no-capture-output", "-n", "curobo"]
-    return None
+# cuRobo's child (_run_curobo_child, _curobo_python_cmd, and its constants)
+# lives in bench_ik_utils — see that module's docstring for the protocol.
 
 
 def _run_solver_subprocess(
@@ -2671,9 +2429,10 @@ def _run_solver_subprocess(
     (ROBOT_TIER) is pinned via PYROFFI_IK_TIER, which is read once on first kernel
     launch; it is harmless (ignored) for JAX/CPU solvers.
 
-    cuRobo is the exception: it runs in its OWN conda env via
-    bench_ik_curobo.py, consuming the target sidecar this script wrote during
-    target generation (see _run_robot_benchmark).
+    cuRobo is the exception: it runs in its OWN conda env, but as THIS SAME
+    file re-invoked with ``--solver cuRobo`` (see _IS_CUROBO_CHILD /
+    _run_curobo_child) — it consumes the target sidecar this script wrote
+    during target generation (see _run_robot_benchmark).
     """
     if solver == "cuRobo":
         prefix = _curobo_python_cmd()
@@ -2685,14 +2444,13 @@ def _run_solver_subprocess(
                 "\n  of baselines/curobo."
             )
             return
-        targets_npz = csv_file.parent / f"bench_ik_targets_{robot_name}.npz"
         cmd = prefix + [
-            str(pathlib.Path(__file__).with_name("bench_ik_curobo.py")),
+            __file__,
             "--robot", robot_name,
-            "--targets", str(targets_npz),
-            "--outdir", str(csv_file.parent),
-            "--env-file", str(ENV_FILE),
+            "--solver", "cuRobo",
         ]
+        if args.outdir is not None:
+            cmd += ["--outdir", str(args.outdir)]
         print(f"\n=== Running {robot_name} / cuRobo in subprocess ({' '.join(prefix)}) ===")
         env = os.environ.copy()
         env.pop("XLA_PYTHON_CLIENT_PREALLOCATE", None)
@@ -2801,6 +2559,21 @@ def main() -> None:
     if args.solver is not None:
         if args.robot is None:
             raise SystemExit("--solver requires --robot (internal child invocation).")
+        if args.solver == "cuRobo":
+            # Separate conda env, no JAX/pyroffi — see _IS_CUROBO_CHILD. Use the
+            # per-robot filtered scene (robot_env_path) if a pyroffi child for
+            # this robot has already built one, else fall back to the shared
+            # catalogue — matches the target-sidecar dependency pattern (cuRobo
+            # is the LAST candidate solver per robot; see _candidate_solvers).
+            _curobo_env_file = robot_env_path(args.robot)
+            if not _curobo_env_file.exists():
+                _curobo_env_file = ENV_FILE
+            _run_curobo_child(
+                args.robot, csv_file,
+                env_file=_curobo_env_file, n_targets=N_TARGETS, n_targets_batch=N_TARGETS_BATCH,
+                n_warmup=N_WARMUP, n_timed=N_TIMED,
+            )
+            return
         _blocks = set(args.blocks.split(",")) if args.blocks else None
         _run_robot_benchmark(args.robot, csv_file, solver_filter=args.solver, blocks=_blocks)
         return

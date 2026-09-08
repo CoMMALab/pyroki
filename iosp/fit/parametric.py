@@ -70,7 +70,14 @@ def screen_stationarity(prob, scenes, inner, theta_ik, by_phase, label,
 
 
 def _build_inner(prob, scenes, theta_ik, forward_solver, seed=0,
-                 residual_override=None, n_restarts=1, restart_jitter=0.35):
+                 residual_override=None, n_restarts=1, restart_jitter=0.35,
+                 constraints_by_phase=None):
+    """`constraints_by_phase` (optional) maps a phase name to a
+    `constraints_fn(ctx) -> tuple[AugmentedLagrangianTerm]`; that phase's forward
+    solve then becomes AL-constrained and its implicit adjoint linearizes the
+    augmented stationarity (see `ioc.inner`).  Constraints must be
+    theta-INDEPENDENT.  `None` (default) is byte-identical to the unconstrained
+    build every existing caller relies on."""
     x0, phase_scenes, _, _ = prob.seeds(scenes, theta_ik)
     inner = {}
     for p in pp.PHASES:
@@ -79,6 +86,7 @@ def _build_inner(prob, scenes, theta_ik, forward_solver, seed=0,
             residual_fn = residual_override[p]
         scales = prob.calibrate_segment(p, residual_fn, phase_scenes[p],
                                         jax.random.PRNGKey(seed))
+        cfn = None if constraints_by_phase is None else constraints_by_phase.get(p)
         # `n_restarts=1` (the default) is byte-for-byte the previous behaviour
         # for every existing caller.  Above 1, each segment solve becomes the
         # best of `n_restarts` local solves, which is what makes x*(theta)
@@ -89,7 +97,8 @@ def _build_inner(prob, scenes, theta_ik, forward_solver, seed=0,
         inner[p] = make_inner_solver(residual_fn, scales,
                                      forward_solver=forward_solver,
                                      n_restarts=n_restarts,
-                                     restart_jitter=restart_jitter)
+                                     restart_jitter=restart_jitter,
+                                     constraints_fn=cfn)
     return inner, x0
 
 

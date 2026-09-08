@@ -202,10 +202,22 @@ def self_collision_table_arrays(robot, collision_checker):
     # Deliberately unguarded: a checker that IS spherized but whose tables fail
     # to build is a bug, and swallowing it here yields a silent no-op that looks
     # exactly like "self-collision had no effect".
-    sph_local, link_start, link_joint, pair_i, pair_j = static_arrays(
-        robot, collision_checker)
-    return (jnp.asarray(sph_local, jnp.float32),
-            jnp.asarray(link_start, jnp.int32),
-            jnp.asarray(link_joint, jnp.int32),
-            jnp.asarray(pair_i, jnp.int32),
-            jnp.asarray(pair_j, jnp.int32))
+    #
+    # static_arrays() does plain-numpy conversion (np.asarray) on the checker's
+    # geometry, which is only valid outside an active JAX trace. robot/
+    # collision_checker are always concrete Python objects here (never a scan
+    # carry or other dynamic value) -- but a caller of THIS function may itself
+    # be running inside a jax.jit/lax.scan trace (e.g. bench_ik.py's timing
+    # harness), where any jnp op -- even one applied to a closed-over constant
+    # -- returns a Tracer, and np.asarray() on a Tracer always raises
+    # TracerArrayConversionError. ensure_compile_time_eval forces this block to
+    # run eagerly regardless of the surrounding trace, which is exactly the
+    # constant-folding case it exists for.
+    with jax.ensure_compile_time_eval():
+        sph_local, link_start, link_joint, pair_i, pair_j = static_arrays(
+            robot, collision_checker)
+        return (jnp.asarray(sph_local, jnp.float32),
+                jnp.asarray(link_start, jnp.int32),
+                jnp.asarray(link_joint, jnp.int32),
+                jnp.asarray(pair_i, jnp.int32),
+                jnp.asarray(pair_j, jnp.int32))

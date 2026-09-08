@@ -38,19 +38,20 @@ def _fmt(x, prec=3):
 
 
 def _fmt_time(s):
+    """Wall-clock in MINUTES (the column's unit) -- always, so a sub-minute time
+    is not silently printed as raw seconds in a `min` column (implicit's 30 s
+    used to read as `30`, i.e. bigger than CMA-ES's 3.7)."""
     if s is None or not math.isfinite(float(s)):
         return "--"
-    s = float(s)
-    if s < 60:
-        return f"{s:.0f}"
-    return f"{s/60:.1f}"
+    return f"{float(s) / 60:.1f}"
 
 
 def main():
     ap = argparse.ArgumentParser()
     here = pathlib.Path(__file__).resolve().parents[1]
     ap.add_argument("--summary", type=str,
-                    default=str(here / "data" / "results" / "e10_methods" / "summary.json"))
+                    default=str(here / "data" / "results" / "e10_methods_principled"
+                                / "summary.json"))
     ap.add_argument("--out", type=str,
                     default=str(here / "figures" / "e10_method_comparison.tex"))
     args = ap.parse_args()
@@ -61,26 +62,31 @@ def main():
     init = S["init_metrics"]
     methods = S["methods"]
 
-    # Assemble rows: (label, jfit, jgen, eefit, eegen, loss, time_min, rank)
+    def _succ(roll):
+        if not roll:
+            return "--"
+        return (f"{roll['fit_success']}/{roll['fit_total']}, "
+                f"{roll['gen_success']}/{roll['gen_total']}")
+
+    # Assemble rows: (label, jfit, jgen, eefit, eegen, succ, time_min)
     rows = []
     for key in ORDER:
         if key == "random":
             m = init
             rows.append((LABELS[key],
                          m["joint_rmse_fit"], m["joint_rmse_gen"],
-                         m["ee_rmse_fit"], m["ee_rmse_gen"], m["loss"],
-                         None, None))
+                         m["ee_rmse_fit"], m["ee_rmse_gen"],
+                         _succ(S.get("init_rollout")), None))
             continue
         if key not in methods:
             continue
         r = methods[key]
         m = r.get("metrics", {})
-        gram = r.get("gram") or {}
         t_total = r.get("wall_total_s")
         rows.append((LABELS[key],
                      m.get("joint_rmse_fit"), m.get("joint_rmse_gen"),
-                     m.get("ee_rmse_fit"), m.get("ee_rmse_gen"), m.get("loss"),
-                     t_total, gram.get("rank")))
+                     m.get("ee_rmse_fit"), m.get("ee_rmse_gen"),
+                     _succ(r.get("rollout")), t_total))
 
     n_fit = S.get("n_fit")
     K = S.get("K")
@@ -91,26 +97,29 @@ def main():
     lines.append(r"\centering")
     lines.append(r"\small")
     lines.append(r"\setlength{\tabcolsep}{5pt}")
-    lines.append(r"\begin{tabular}{lcccccc}")
+    lines.append(r"\begin{tabular}{lccccccc}")
     lines.append(r"\toprule")
     lines.append(r"& \multicolumn{2}{c}{Joint RMSE (rad)} "
                  r"& \multicolumn{2}{c}{EE RMSE (m)} & & \\")
     lines.append(r"\cmidrule(lr){2-3}\cmidrule(lr){4-5}")
     lines.append(r"Method & Fit & Held-out & Fit & Held-out "
-                 r"& Loss & Time (min) \\")
+                 r"& Task success & Time (min) \\")
     lines.append(r"\midrule")
-    for (label, jf, jg, ef, eg, loss, t, rank) in rows:
+    for (label, jf, jg, ef, eg, succ, t) in rows:
         lines.append(
             f"{label} & {_fmt(jf)} & {_fmt(jg)} & {_fmt(ef)} & {_fmt(eg)} "
-            f"& {_fmt(loss)} & {_fmt_time(t)} \\\\")
+            f"& {succ} & {_fmt_time(t)} \\\\")
     lines.append(r"\bottomrule")
     lines.append(r"\end{tabular}")
     cap = (r"\caption{Inverse-cost recovery on the FR3 human teleoperation "
            f"episodes ({n_fit} fit / held-out split, ${K}$ cost weights). "
            r"Reconstruction error is the RMSE of the fitted trajectory-optimiser "
            r"rollout against the demonstrated joint trajectory; the end-effector "
-           r"RMSE is reported from the same rollout. `Random weights' is the "
-           r"$u=0$ prior. Time is total wall clock (compile + inference).}")
+           r"RMSE is reported from the same rollout. Task success is the "
+           r"cube-in-bucket count (fit, held-out) when the fitted rollout is "
+           r"executed in contact physics -- a VERIFICATION metric, never part of "
+           r"the fitting loss. `Random weights' is the $u=0$ prior. Time is total "
+           r"wall clock (compile + inference).}")
     lines.append(cap)
     lines.append(r"\label{tab:e10_methods}")
     lines.append(r"\end{table}")

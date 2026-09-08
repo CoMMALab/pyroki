@@ -10,10 +10,8 @@
 Method & Fit & Held-out & Fit & Held-out & Task success & Time (min) \\
 \midrule
 Random weights & 1.237 & 1.153 & 0.593 & 0.612 & 0/8, 0/2 & -- \\
-Implicit diff. & 1.162 & 1.058 & 0.540 & 0.555 & 8/8, 2/2 & 1.0 \\
-Finite diff. & 1.221 & 1.114 & 0.584 & 0.600 & 0/8, 0/2 & 7.1 \\
-CMA-ES & 0.837 & 0.673 & 0.136 & 0.103 & 3/8, 0/2 & 4.3 \\
-Unrolled & 1.231 & 1.124 & 0.596 & 0.611 & 0/8, 0/2 & 8.0 \\
+Implicit diff. & 1.162 & 1.065 & 0.540 & 0.554 & 8/8, 2/2 & 1.5 \\
+CMA-ES & 0.837 & 0.673 & 0.136 & 0.103 & 3/8, 0/2 & 10.9 \\
 \bottomrule
 \end{tabular}
 \caption{Inverse-cost recovery on the FR3 human teleoperation episodes (8 fit / held-out split, $11$ cost weights). Reconstruction error is the RMSE of the fitted trajectory-optimiser rollout against the demonstrated joint trajectory; the end-effector RMSE is reported from the same rollout. Task success is the cube-in-bucket count (fit, held-out) when the fitted rollout is executed in contact physics -- a VERIFICATION metric, never part of the fitting loss. `Random weights' is the $u=0$ prior. Time is total wall clock (compile + inference).}

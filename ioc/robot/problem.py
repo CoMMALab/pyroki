@@ -34,6 +34,7 @@ EE_LINK = "panda_hand"  # default; `load(ee_link=...)` for a different arm
 CLEARANCE_MARGIN = 0.05  # [m] distance at which the collision feature turns on
 SOFTMIN_TAU = 0.02  # [m] temperature of the soft-min over collision pairs
 SOFTNESS = 60.0  # smoothing of the collision hinge; keeps the Hessian continuous
+BOX_SOFTNESS = 200.0  # smoothing of the box-face max in `signed_clearance`
 
 Q_START = np.array([0.0, -0.6, 0.0, -2.2, 0.0, 1.6, 0.8])
 Q_GOAL = np.array([0.9, -0.2, 0.0, -1.8, 0.0, 1.7, 0.8])
@@ -48,6 +49,27 @@ class Scene:
     q_goal: jnp.ndarray  # (dof,)
     obs_center: jnp.ndarray  # (3,)
     obs_radius: jnp.ndarray  # (1,)
+
+    # -- the rest of the world, optional -------------------------------------
+    # `obs_center`/`obs_radius` is ONE sphere, which is all the synthetic
+    # studies ever needed.  The teleop scenes need more: MEASURED on the ten FR3
+    # episodes, the single sphere they inherit is a stale placeholder from an
+    # obstacle the recorder no longer builds, it sits IN the transport corridor
+    # (z 0.39-0.49 above a 0.35 table, between the cube and the buckets), and the
+    # demonstrations penetrate it on 68 of 230 rows.  Meanwhile the two things
+    # the operator actually had to avoid -- the table and the bucket wall -- were
+    # not in the world at all, so a fitted path gliding through the bucket rim
+    # was the model being correct about a world with no bucket in it.
+    #
+    # Both default to None, which is a leaf-less pytree node: `jax.vmap` and
+    # `jax.tree.map` skip it and every existing caller is byte-identical.
+    obs_spheres: jnp.ndarray = None  # (M, 4) xyz+radius, or None
+    # (6,) [cx, cy, cz, hx, hy, hz] axis-aligned box, or None.  A BOX, not a
+    # `z >= table_top` half-space: the arm is mounted BESIDE the table (base at
+    # x ~ 0, table spanning x 0.20-0.90), so a half-space marks the robot's own
+    # base links as permanently penetrating and the soft-min collapses to a
+    # constant -0.38 m for every configuration.
+    table_box: jnp.ndarray = None
 
 
 def make_world(scene: Scene):
@@ -77,6 +99,22 @@ class RobotProblem:
     # HARD task waypoints -- a soft `skeleton` cost lets the refine drift off the
     # grasp (~100 mm) and, for tetris, wander out of joint limits.
     pinned_rows: tuple = ()
+    # Extra decision variables appended to `x_flat` after the interior
+    # waypoints.  0 (the default) is byte-identical to every existing caller.
+    #
+    # The standard trajopt basis needs ONE: the segment's log-duration `s`, with
+    # `T = duration_nominal * exp(s)`.  Exponential rather than `T` itself, or a
+    # clipped/softplus `T`, because the inner solve is required to stay
+    # UNCONSTRAINED for Gauss-Newton (see the module docstring) and `exp` keeps
+    # `T > 0` for every real `s` with no barrier and no kink.
+    #
+    # A duration variable is what makes a min-time term mean anything: with `dt`
+    # fixed, "time" is a constant and its weight is pure gauge.  With `dt` free
+    # the basis features scale as different powers of T -- path T^0, acceleration
+    # T^-2, jerk T^-3, effort mixed, time T^+1 -- and that spread of exponents is
+    # exactly what makes the speed/smoothness trade-off identifiable.
+    n_aux: int = 0
+    duration_nominal: float = 1.0
 
     @staticmethod
     def load(urdf_path, srdf_path, mesh_dir, n_timesteps, ee_link=EE_LINK):
@@ -104,9 +142,32 @@ class RobotProblem:
 
     # -- trajectory parameterization -----------------------------------------
 
+    def n_x(self):
+        """Length of `x_flat`: interior waypoints plus any auxiliary variables."""
+        return (self.n_timesteps - 2) * self.dof + self.n_aux
+
+    def unpack_aux(self, x_flat):
+        """The auxiliary tail of `x_flat`, `(n_aux,)`.  Empty when `n_aux == 0`."""
+        return x_flat[x_flat.shape[0] - self.n_aux:] if self.n_aux else x_flat[:0]
+
+    def duration(self, x_flat):
+        """Segment duration `T = duration_nominal * exp(s)`, seconds.
+
+        Falls back to `duration_nominal` when the problem carries no auxiliary
+        variable, so a basis that asks for `dt` works unchanged on a fixed-time
+        problem."""
+        if not self.n_aux:
+            return jnp.asarray(self.duration_nominal)
+        return self.duration_nominal * jnp.exp(self.unpack_aux(x_flat)[0])
+
+    def dt(self, x_flat):
+        """Uniform knot spacing implied by the segment duration."""
+        return self.duration(x_flat) / (self.n_timesteps - 1)
+
     def unpack(self, x_flat, scene):
         """Interior waypoints -> full trajectory with the endpoints clamped on."""
-        interior = x_flat.reshape(self.n_timesteps - 2, self.dof)
+        n_q = (self.n_timesteps - 2) * self.dof
+        interior = x_flat[:n_q].reshape(self.n_timesteps - 2, self.dof)
         q = jnp.concatenate(
             [scene.q_start[None, :], interior, scene.q_goal[None, :]], axis=0
         )
@@ -115,9 +176,14 @@ class RobotProblem:
         return q
 
     def seed(self, scene):
-        """Straight line in joint space between the endpoints."""
+        """Straight line in joint space between the endpoints.
+
+        Auxiliary variables seed at 0, i.e. the nominal duration."""
         alphas = jnp.linspace(0.0, 1.0, self.n_timesteps)[1:-1, None]
-        return ((1 - alphas) * scene.q_start + alphas * scene.q_goal).reshape(-1)
+        q = ((1 - alphas) * scene.q_start + alphas * scene.q_goal).reshape(-1)
+        if self.n_aux:
+            q = jnp.concatenate([q, jnp.zeros(self.n_aux, q.dtype)])
+        return q
 
     def seeds(self, scenes):
         return jax.vmap(self.seed)(scenes)
@@ -128,19 +194,46 @@ class RobotProblem:
     # -- shared feature pieces -------------------------------------------------
 
     def signed_clearance(self, q, scene):
-        """Per-waypoint smooth signed clearance ``d_min`` (T,) to the obstacle:
-        the soft-min over all robot spheres of sphere-vs-obstacle distance.
+        """Per-waypoint smooth signed clearance ``d_min`` (T,) to the world:
+        the soft-min over all robot spheres of distance to every obstacle.
         Positive = clear, negative = penetrating.  Every reduction is a soft-min
-        (closed-form sphere distance), never a hard max, so ``d_min`` is smooth
-        and its gradient vanishes at a true optimum -- see ``clearance_residual``
-        for why that matters for the implicit adjoint / FD."""
+        (closed-form sphere/half-space distance), never a hard max, so ``d_min``
+        is smooth and its gradient vanishes at a true optimum -- see
+        ``clearance_residual`` for why that matters for the implicit adjoint/FD.
+
+        The world is the primary sphere, plus `scene.obs_spheres` if present,
+        plus the `scene.table_z` half-space if present.  All three reduce into
+        ONE soft-min, so adding geometry never introduces a hard switch between
+        obstacle sets."""
         coll = self.robot_coll.at_config(self.robot, q)  # (T, S, N) spheres
-        d = (
-            jnp.linalg.norm(coll.pose.translation() - scene.obs_center, axis=-1)
-            - coll.radius
-            - scene.obs_radius[0]
-        )
-        d = d.reshape(d.shape[0], -1)  # (T, S*N)
+        c = coll.pose.translation()  # (T, S, N, 3)
+        r = coll.radius  # (T, S, N) or broadcastable
+        T = c.shape[0]
+
+        parts = [(jnp.linalg.norm(c - scene.obs_center, axis=-1)
+                  - r - scene.obs_radius[0]).reshape(T, -1)]
+
+        if scene.obs_spheres is not None:
+            # (T, S, N, 1, 3) vs (M, 3) -> (T, S, N, M)
+            o = scene.obs_spheres
+            d = (jnp.linalg.norm(c[..., None, :] - o[..., :3], axis=-1)
+                 - r[..., None] - o[..., 3])
+            parts.append(d.reshape(T, -1))
+
+        if scene.table_box is not None:
+            # Smooth EXTERIOR distance to an axis-aligned box.  `softplus`
+            # rather than `max(., 0)` for the same reason `clearance_residual`
+            # avoids a hard max: the kink sits exactly on the face the solver
+            # rides.  Saturates at ~0 inside the box instead of going negative,
+            # which is acceptable here -- the demonstrations DO touch the table,
+            # so what matters is that the term switches on at contact, not that
+            # it keeps growing once the arm is through the surface.
+            box = scene.table_box
+            qx = jnp.abs(c - box[:3]) - box[3:]
+            sp = jax.nn.softplus(BOX_SOFTNESS * qx) / BOX_SOFTNESS
+            parts.append((jnp.linalg.norm(sp, axis=-1) - r).reshape(T, -1))
+
+        d = jnp.concatenate(parts, axis=-1)
         return -SOFTMIN_TAU * jax.scipy.special.logsumexp(-d / SOFTMIN_TAU, axis=-1)
 
     def clearance_residual(self, q, scene):
