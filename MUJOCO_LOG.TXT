@@ -409,3 +409,144 @@ nkey: parent has 0, child has 1, keeping parent value
 WARNING Tue Sep  8 16:35:43 2026: Attach conflict when attaching 'fr3', policy is 'warning'
 nkey: parent has 0, child has 1, keeping parent value
 
+WARNING Tue Sep  8 17:45:48 2026: Attach conflict when attaching 'fr3', policy is 'warning'
+nkey: parent has 0, child has 1, keeping parent value
+
+WARNING Tue Sep  8 17:45:48 2026: Attach conflict when attaching 'fr3', policy is 'warning'
+nkey: parent has 0, child has 1, keeping parent value
+
+WARNING Tue Sep  8 17:45:48 2026: Attach conflict when attaching 'fr3', policy is 'warning'
+nkey: parent has 0, child has 1, keeping parent value
+
+WARNING Tue Sep  8 17:45:48 2026: Attach conflict when attaching 'fr3', policy is 'warning'
+nkey: parent has 0, child has 1, keeping parent value
+
+WARNING Tue Sep  8 17:46:19 2026: Attach conflict when attaching 'fr3', policy is 'warning'
+nkey: parent has 0, child has 1, keeping parent value
+
+WARNING Tue Sep  8 17:46:19 2026: Attach conflict when attaching 'fr3', policy is 'warning'
+nkey: parent has 0, child has 1, keeping parent value
+
+WARNING Tue Sep  8 17:46:19 2026: Attach conflict when attaching 'fr3', policy is 'warning'
+nkey: parent has 0, child has 1, keeping parent value
+
+WARNING Tue Sep  8 17:46:19 2026: Attach conflict when attaching 'fr3', policy is 'warning'
+nkey: parent has 0, child has 1, keeping parent value
+
+WARNING Tue Sep  8 23:20:24 2026: Attach conflict when attaching 'fr3', policy is 'warning'
+nkey: parent has 0, child has 1, keeping parent value
+
+WARNING Tue Sep  8 23:20:24 2026: Attach conflict when attaching 'fr3', policy is 'warning'
+nkey: parent has 0, child has 1, keeping parent value
+
+WARNING Tue Sep  8 23:20:24 2026: Attach conflict when attaching 'fr3', policy is 'warning'
+nkey: parent has 0, child has 1, keeping parent value
+
+WARNING Tue Sep  8 23:20:24 2026: Attach conflict when attaching 'fr3', policy is 'warning'
+nkey: parent has 0, child has 1, keeping parent value
+
+WARNING Tue Sep  8 23:21:53 2026: Attach conflict when attaching 'fr3', policy is 'warning'
+nkey: parent has 0, child has 1, keeping parent value
+
+WARNING Tue Sep  8 23:21:53 2026: Attach conflict when attaching 'fr3', policy is 'warning'
+nkey: parent has 0, child has 1, keeping parent value
+
+WARNING Tue Sep  8 23:21:53 2026: Attach conflict when attaching 'fr3', policy is 'warning'
+nkey: parent has 0, child has 1, keeping parent value
+
+WARNING Tue Sep  8 23:21:53 2026: Attach conflict when attaching 'fr3', policy is 'warning'
+nkey: parent has 0, child has 1, keeping parent value
+
+WARNING Tue Sep  8 23:25:11 2026: Attach conflict when attaching 'fr3', policy is 'warning'
+nkey: parent has 0, child has 1, keeping parent value
+
+WARNING Tue Sep  8 23:25:11 2026: Attach conflict when attaching 'fr3', policy is 'warning'
+nkey: parent has 0, child has 1, keeping parent value
+
+WARNING Tue Sep  8 23:25:11 2026: Attach conflict when attaching 'fr3', policy is 'warning'
+nkey: parent has 0, child has 1, keeping parent value
+
+WARNING Tue Sep  8 23:25:11 2026: Attach conflict when attaching 'fr3', policy is 'warning'
+nkey: parent has 0, child has 1, keeping parent value
+
+WARNING Tue Sep  8 23:25:28 2026: Attach conflict when attaching 'fr3', policy is 'warning'
+nkey: parent has 0, child has 1, keeping parent value
+
+WARNING Tue Sep  8 23:25:28 2026: Attach conflict when attaching 'fr3', policy is 'warning'
+nkey: parent has 0, child has 1, keeping parent value
+
+WARNING Tue Sep  8 23:25:28 2026: Attach conflict when attaching 'fr3', policy is 'warning'
+nkey: parent has 0, child has 1, keeping parent value
+
+WARNING Tue Sep  8 23:25:28 2026: Attach conflict when attaching 'fr3', policy is 'warning'
+nkey: parent has 0, child has 1, keeping parent value
+
+WARNING Wed Sep  9 12:51:09 2026: Attach conflict when attaching 'panda', policy is 'warning'
+integrator: parent has 0, child has 3, keeping parent value
+
+WARNING Wed Sep  9 12:51:09 2026: Attach conflict when attaching 'panda', policy is 'warning'
+integrator: parent has 0, child has 3, keeping parent value
+
+WARNING Wed Sep  9 12:51:09 2026: Attach conflict when attaching 'panda', policy is 'warning'
+integrator: parent has 0, child has 3, keeping parent value
+
+WARNING Wed Sep  9 21:49:39 2026: Nan, Inf or huge value in QACC at DOF 9. The simulation is unstable. Time = 1.8760.
+
+WARNING Wed Sep  9 21:50:18 2026: Nan, Inf or huge value in QACC at DOF 17. The simulation is unstable. Time = 9.0300.
+
+WARNING Wed Sep  9 21:50:42 2026: Nan, Inf or huge value in QACC at DOF 17. The simulation is unstable. Time = 9.0300.
+
+WARNING Wed Sep  9 21:51:28 2026: Nan, Inf or huge value in QACC at DOF 15. The simulation is unstable. Time = 9.3300.
+
+WARNING Wed Sep  9 21:52:17 2026: Nan, Inf or huge value in QACC at DOF 15. The simulation is unstable. Time = 9.3300.
+
+WARNING Wed Sep  9 21:52:46 2026: Nan, Inf or huge value in QACC at DOF 15. The simulation is unstable. Time = 9.8860.
+
+WARNING Thu Sep 10 08:25:40 2026: Attach conflict when attaching 'fr3', policy is 'warning'
+nkey: parent has 0, child has 1, keeping parent value
+
+WARNING Thu Sep 10 08:25:40 2026: Attach conflict when attaching 'fr3', policy is 'warning'
+nkey: parent has 0, child has 1, keeping parent value
+
+WARNING Thu Sep 10 08:25:40 2026: Attach conflict when attaching 'fr3', policy is 'warning'
+nkey: parent has 0, child has 1, keeping parent value
+
+WARNING Thu Sep 10 08:25:40 2026: Attach conflict when attaching 'fr3', policy is 'warning'
+nkey: parent has 0, child has 1, keeping parent value
+
+WARNING Thu Sep 10 08:26:16 2026: Attach conflict when attaching 'fr3', policy is 'warning'
+nkey: parent has 0, child has 1, keeping parent value
+
+WARNING Thu Sep 10 08:26:16 2026: Attach conflict when attaching 'fr3', policy is 'warning'
+nkey: parent has 0, child has 1, keeping parent value
+
+WARNING Thu Sep 10 08:26:16 2026: Attach conflict when attaching 'fr3', policy is 'warning'
+nkey: parent has 0, child has 1, keeping parent value
+
+WARNING Thu Sep 10 08:26:16 2026: Attach conflict when attaching 'fr3', policy is 'warning'
+nkey: parent has 0, child has 1, keeping parent value
+
+WARNING Thu Sep 10 08:26:39 2026: Attach conflict when attaching 'fr3', policy is 'warning'
+nkey: parent has 0, child has 1, keeping parent value
+
+WARNING Thu Sep 10 08:26:39 2026: Attach conflict when attaching 'fr3', policy is 'warning'
+nkey: parent has 0, child has 1, keeping parent value
+
+WARNING Thu Sep 10 08:26:39 2026: Attach conflict when attaching 'fr3', policy is 'warning'
+nkey: parent has 0, child has 1, keeping parent value
+
+WARNING Thu Sep 10 08:26:39 2026: Attach conflict when attaching 'fr3', policy is 'warning'
+nkey: parent has 0, child has 1, keeping parent value
+
+WARNING Thu Sep 10 08:38:40 2026: Attach conflict when attaching 'fr3', policy is 'warning'
+nkey: parent has 0, child has 1, keeping parent value
+
+WARNING Thu Sep 10 08:38:40 2026: Attach conflict when attaching 'fr3', policy is 'warning'
+nkey: parent has 0, child has 1, keeping parent value
+
+WARNING Thu Sep 10 08:38:40 2026: Attach conflict when attaching 'fr3', policy is 'warning'
+nkey: parent has 0, child has 1, keeping parent value
+
+WARNING Thu Sep 10 08:38:40 2026: Attach conflict when attaching 'fr3', policy is 'warning'
+nkey: parent has 0, child has 1, keeping parent value
+

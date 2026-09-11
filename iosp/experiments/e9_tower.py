@@ -27,22 +27,55 @@ from ioc.inner import make_inner_solver
 from iosp.model import tower as tw
 from iosp.config import URDF_PATH, SRDF_PATH, MESH_DIR
 
-Z_STAR = jnp.array([0.5, 1.5, 1.0, 0.8, 1.2, 1.0, 2.0], dtype=jnp.float32)  # ...,z_align,torque,skeleton
+# effort/smooth raised from (0.5, 1.5); see `e8_tetris.Z_STAR` for the
+# reasoning.  Tower was the worse of the two -- joint6 commanded to 298 deg
+# against a 215 deg limit, 84 deg of overshoot -- and unlike tetris the
+# violation genuinely broke the task: 0/6 executed rollouts at the old weights
+# against 6/6 here.
+# clearance raised 1.0 -> 3.0 (4.3% -> 24.8% of the softmax).  Measured over
+# logits 1/2/3/4: the tallest passing stack is 8 levels at ALL of them, so the
+# weight is free, and it buys real margin on the obstacles the arm CAN avoid --
+# closest-approach on the binding one goes 62.6 -> 91.5 mm (102.3 at logit 4,
+# which was not taken: at 47% of the basis clearance starts to swamp the other
+# six features).
+#
+# It cannot fix every clip.  The worst remaining approach, -9.7 mm into the
+# sphere at [0, -0.1, 0.9], is at ROW 0 -- `q_start`, a PINNED row -- and comes
+# from `sample_tower_scenes`' 0.05 rad jitter on Q_HOME, which itself clears by
+# +19.7 mm.  No cost weight moves a pinned row.
+Z_STAR = jnp.array([3.5, 2.5, 3.0, 0.8, 1.2, 1.0, 2.0], dtype=jnp.float32)  # ...,z_align,torque,skeleton
 PARAM_NAMES = list(tw.FEATURE_NAMES)
 
 
-def build(seed=0, n_iters=60, n_scenes=6, stack_level=0):
-    prob = tw.TowerProblem.load(str(URDF_PATH), str(SRDF_PATH), str(MESH_DIR))
-    fs = tw.make_tower_forward_solver(n_iters=n_iters, robot=prob.base.robot)
+def build(seed=0, n_iters=60, n_scenes=6, stack_level=0, jitter_q=0.05,
+          fit_scenes=None, test_scenes=None):
+    """`fit_scenes`/`test_scenes` override the sampler.
 
-    rng = np.random.default_rng(seed)
-    scenes_all = tw.sample_tower_scenes(rng, 2 * n_scenes,
-                                         stack_level=stack_level)
-    fit = jax.tree.map(lambda a: a[:n_scenes], scenes_all)
-    test = jax.tree.map(lambda a: a[n_scenes:], scenes_all)
+    Pass them when two conditions have to be graded against the SAME held-out
+    set -- `e12_demo_diversity` compares a narrow demo set against a randomised
+    one, and that comparison is only meaningful if the thing they are both
+    tested on is held fixed.  The inner solvers are calibrated on whichever
+    scenes end up as `fit`, which is the existing behaviour.
+    """
+    prob = tw.TowerProblem.load(str(URDF_PATH), str(SRDF_PATH), str(MESH_DIR))
+    # See `e8_tetris.build`: IOSP_STOCK_SOLVER=1 restores the early-stopping
+    # `while_loop`, which is much cheaper to compile when not differentiating.
+    stock = os.environ.get("IOSP_STOCK_SOLVER", "0") == "1"
+    fs = tw.make_tower_forward_solver(n_iters=n_iters, robot=prob.base.robot,
+                                      stock=stock)
+
+    if fit_scenes is None or test_scenes is None:
+        rng = np.random.default_rng(seed)
+        scenes_all = tw.sample_tower_scenes(rng, 2 * n_scenes,
+                                            stack_level=stack_level,
+                                            jitter_q=jitter_q)
+        fit = jax.tree.map(lambda a: a[:n_scenes], scenes_all)
+        test = jax.tree.map(lambda a: a[n_scenes:], scenes_all)
+    else:
+        fit, test = fit_scenes, test_scenes
 
     key = jax.random.PRNGKey(seed)
-    x0, seg_scenes, q_pick, q_place = prob.seeds(fit)
+    x0, seg_scenes, q_pick, q_place, q_prepick, q_preplace = prob.seeds(fit)
 
     inner_by_phase = {}
     for p in tw.PHASES:
@@ -54,12 +87,13 @@ def build(seed=0, n_iters=60, n_scenes=6, stack_level=0):
     full_sc = tw.TowerFullScene(
         fit.q_start, fit.q_start,
         fit.obs_center, fit.obs_radius,
-        q_pick, q_place, fit.target_z)
+        q_pick, q_place, fit.target_z, q_prepick, q_preplace)
     full_scales = prob.calibrate_full(full_rf, full_sc, key)
     refine = make_inner_solver(full_rf, full_scales, forward_solver=fs)
 
     return dict(prob=prob, fit=fit, test=test, inner_by_phase=inner_by_phase,
-                refine=refine, fs=fs, seed=seed, stack_level=stack_level)
+                refine=refine, fs=fs, seed=seed, stack_level=stack_level,
+                full_scales=full_scales)
 
 
 def ee_paths(built, scenes, z, *, stage2=True):

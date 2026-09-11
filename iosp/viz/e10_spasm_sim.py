@@ -138,13 +138,30 @@ def _in_bucket(scene, cube_xyz, margin=0.0):
     return inside, dxy, z - floor_top
 
 
-def physics_success(episode_index, q_path, *, verbose=False, **kw):
-    """Drive `q_path` (N_FULL, 7) through episode `episode_index`'s physics scene
-    and report whether the cube ends in the bucket.  The reusable entry point for
-    scoring a reconstruction's ROLLOUT SUCCESS (as opposed to its EE RMSE)."""
+def physics_success(episode_index, q_path, *, episode_path=None, verbose=False,
+                    **kw):
+    """Drive `q_path` (N_FULL, 7) through one episode's physics scene and report
+    whether the cube ends in the bucket.  The reusable entry point for scoring a
+    reconstruction's ROLLOUT SUCCESS (as opposed to its EE RMSE).
+
+    PASS `episode_path` -- the episode directory the caller actually built --
+    whenever the batch is not exactly `DEFAULT_DEMO_DIR`'s episodes in order.
+    `episode_index` alone resolves against that one directory, which is wrong
+    in two ways once the fit and held-out sets come from different sessions:
+    an index past its length raises IndexError, and an index inside it
+    SILENTLY scores the path in some other episode's scene -- a different cube
+    and bucket -- which reads as a catastrophic rollout failure (dxy of
+    200-460 mm) rather than as the lookup bug it is.  `episode_index` is kept
+    only as the fallback for the single-session callers in this module's CLI.
+    """
+    import pathlib as _pl
     from iosp.viz import e10_teleop_viser as tv
-    episodes = tv.find_episodes(tv.DEFAULT_DEMO_DIR)
-    ctx = tv.build_ctx(str(tv.DEFAULT_DEMO_DIR), episodes[episode_index])
+    if episode_path is not None:
+        ep = _pl.Path(episode_path)
+        ctx = tv.build_ctx(str(ep.parent), ep.name)
+    else:
+        episodes = tv.find_episodes(tv.DEFAULT_DEMO_DIR)
+        ctx = tv.build_ctx(str(tv.DEFAULT_DEMO_DIR), episodes[episode_index])
     landed = execute(ctx, np.asarray(q_path), verbose=verbose, **kw)
     cube = _cube_xyz(ctx)
     inside, dxy, dz = _in_bucket(ctx["scene"], cube)

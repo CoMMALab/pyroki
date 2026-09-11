@@ -88,6 +88,7 @@ from iosp.fit.params import z_scale
 from iosp.fit.parametric import _build_inner, screen_stationarity
 from iosp.model import fr3, pickplace as pp
 from iosp.model.pickplace import split_trajopt as _split_trajopt
+from iosp.model.pickplace import split_trajopt_perseg as _split_trajopt_perseg
 
 # `fr3_hand` (the EE frame) to `fr3_hand_tcp`, from the URDF's fixed joint.
 TCP_OFFSET_M = 0.1034
@@ -97,6 +98,25 @@ DEFAULT_TELEOP_ROOT = pathlib.Path(
                    pathlib.Path(__file__).resolve().parents[3] / "sim_teleop")
 )
 DEFAULT_DEMO_DIR = DEFAULT_TELEOP_ROOT / "data" / "demos"
+
+# The in-repo copy of the recorded sessions, so an E10 run does not depend on a
+# sibling checkout being present or on `data/demos` still pointing where it did.
+#   fit/   23 episodes, session of 2026-09-03 (`sim_teleop/data/train_demos`).
+#          FOUR of the recorded 27 are quarantined in `excluded/` -- with the
+#          release pinned to the bucket centre their bucket (0.70-0.75 m from
+#          the base) is out of reach, the pinned IK target is infeasible, and
+#          the rollout runs away to 195-799 rad. See `excluded/EXCLUDED.json`;
+#          `find_episodes` never sees them because they are not under `fit/`.
+#   test/  10 episodes, session of 2026-09-02 (`sim_teleop/data/test_demos`,
+#          which `sim_teleop/data/demos` symlinks to) -- the ORIGINAL ten, which
+#          used to be split 8 fit / 2 held and are now held out in full.
+# Two SESSIONS, not a shuffle of one: the generalisation question E10 asks is
+# whether a cost fitted on one sitting reproduces another, which is strictly
+# harder than a within-session split and is why the split is by DIRECTORY
+# rather than by index.
+LOCAL_DEMO_ROOT = pathlib.Path(__file__).resolve().parents[1] / "data" / "demos"
+FIT_DEMO_DIR = LOCAL_DEMO_ROOT / "fit"
+TEST_DEMO_DIR = LOCAL_DEMO_ROOT / "test"
 
 
 def _import_exporter(teleop_root=DEFAULT_TELEOP_ROOT):
@@ -120,19 +140,51 @@ def _import_exporter(teleop_root=DEFAULT_TELEOP_ROOT):
     return iosp_export
 
 
+def _as_dirs(demo_dir):
+    """One path or a sequence of them -> a list of paths, order preserved."""
+    if isinstance(demo_dir, (str, os.PathLike)):
+        return [pathlib.Path(demo_dir)]
+    return [pathlib.Path(d) for d in demo_dir]
+
+
 def find_episodes(demo_dir=DEFAULT_DEMO_DIR):
-    """Every episode directory holding both files, sorted by name (= by time)."""
-    demo_dir = pathlib.Path(demo_dir)
-    eps = sorted(d for d in demo_dir.iterdir()
-                 if (d / "state.jsonl").exists() and (d / "factors.json").exists())
-    if not eps:
-        raise FileNotFoundError(f"no episodes with state.jsonl + factors.json in {demo_dir}")
+    """Every episode directory holding both files, sorted by name (= by time).
+
+    `demo_dir` may be a SEQUENCE of directories (or of episode directories
+    themselves), in which case each is sorted
+    internally and they are CONCATENATED in the order given.  That order is what
+    the fit/held split is taken on, so the concatenation must not be re-sorted
+    globally -- with a fit directory recorded after the held-out one, a global
+    sort would put the held-out episodes first and silently invert the split.
+    """
+    eps = []
+    for d in _as_dirs(demo_dir):
+        if (d / "state.jsonl").exists() and (d / "factors.json").exists():
+            # `d` is itself an episode.  Accepting these makes an explicit
+            # episode LIST a valid `demo_dir`, which is how the demo-count
+            # ablation hands over a truncated fit prefix without materialising
+            # a directory per n.
+            eps.append(d)
+            continue
+        found = sorted(x for x in d.iterdir()
+                       if (x / "state.jsonl").exists() and (x / "factors.json").exists())
+        if not found:
+            raise FileNotFoundError(
+                f"no episodes with state.jsonl + factors.json in {d}")
+        eps.extend(found)
     return eps
 
 
 def load_demos(demo_dir=DEFAULT_DEMO_DIR, teleop_root=DEFAULT_TELEOP_ROOT,
-               prob=None, anchor_grasp=False, max_episodes=None):
+               prob=None, anchor_grasp=False, max_episodes=None,
+               return_paths=False):
     """-> (names, (B, N_FULL, dof) waypoints, batched `PickPlaceScene`).
+
+    `return_paths=True` appends the episode DIRECTORIES in batch order.  Names
+    alone are not enough to find an episode again once the batch spans two
+    sessions: anything that re-resolves a name against a single directory
+    (physics rollout, viser playback) silently picks the wrong scene or falls
+    off the end.
 
     `anchor_grasp=True` fills `pick_wxyz`/`grasp_ref` AND `place_wxyz`/
     `place_ref` from each episode's own configuration at the skeleton grasp and
@@ -165,7 +217,43 @@ def load_demos(demo_dir=DEFAULT_DEMO_DIR, teleop_root=DEFAULT_TELEOP_ROOT,
             grasp_ref=q_grasp.astype(jnp.float32),
             place_wxyz=fk(q_place).astype(jnp.float32),
             place_ref=q_place.astype(jnp.float32))
+    if return_paths:
+        return [d.name for d in eps], demo_q, scenes, list(eps)
     return [d.name for d in eps], demo_q, scenes
+
+
+def mixed_split(n_train=None, n_orig_fit=0, fit_dir=FIT_DEMO_DIR,
+                orig_dir=TEST_DEMO_DIR):
+    """-> (fit episode dirs, held-out episode dirs) for a MIXED split.
+
+    `n_train` episodes from the 2026-09-03 session plus the FIRST `n_orig_fit`
+    of the 2026-09-02 session are fitted; the REMAINING 2026-09-02 episodes
+    are held out.  `n_orig_fit=0` is the pure cross-session split (fit on one
+    sitting, test on the other).
+
+    Why mix at all: the pure split asks the hardest question but confounds two
+    things, because the sessions differ in more than identity -- 2026-09-03
+    randomised the bucket out to 0.75 m where 2026-09-02 never passed 0.670 m
+    (which is what broke the four episodes in `demos/excluded`).  Putting a
+    few 2026-09-02 episodes in the fit set means the held-out five are drawn
+    from a distribution the fit has actually seen, so a gap is the cost of
+    generalising rather than of extrapolating the workspace.
+
+    The 2026-09-02 side is split CHRONOLOGICALLY, first `n_orig_fit` to the
+    fit set: a random split of a single sitting leaks late-session technique
+    backwards, which is the same reason the within-directory split has always
+    been a prefix.
+    """
+    train = find_episodes(fit_dir)
+    orig = find_episodes(orig_dir)
+    if n_train is not None:
+        if not 0 < int(n_train) <= len(train):
+            raise ValueError(f"n_train must be in (0, {len(train)}]; got {n_train}")
+        train = train[: int(n_train)]
+    if not 0 <= int(n_orig_fit) < len(orig):
+        raise ValueError(f"n_orig_fit must be in [0, {len(orig)}); "
+                         f"got {n_orig_fit}")
+    return train + orig[: int(n_orig_fit)], orig[int(n_orig_fit):]
 
 
 def z_prior(K, n_ik, standoffs=None):
@@ -259,11 +347,12 @@ def project_release_offset(standoffs, cap):
     return s
 
 
-def build_teleop(demo_dir=DEFAULT_DEMO_DIR, teleop_root=DEFAULT_TELEOP_ROOT,
+def build_pick_and_place(demo_dir=FIT_DEMO_DIR, teleop_root=DEFAULT_TELEOP_ROOT,
+                 held_dir=TEST_DEMO_DIR, n_fit_max=None,
                  n_fit=None, seed=0, n_iters=600, n_restarts=1, space="joint",
                  fast_forward=True, freeze_ik=False, ee_weight=0.0,
                  pin_ik=None, upright_floor=0.0, free_space_only=False,
-                 hard_upright=(), duration_weight=1.0):
+                 hard_upright=(), duration_weight=1.0, per_segment=False):
     """The `built` dict `iosp.fit.procedure.run_procedure` consumes.
 
     `space` defaults to "joint", not "ee" as in `build_parametric`: the
@@ -278,6 +367,24 @@ def build_teleop(demo_dir=DEFAULT_DEMO_DIR, teleop_root=DEFAULT_TELEOP_ROOT,
     carrying a seed, and it is the honest one for a human demonstrator whose
     technique drifts over a session -- a random split leaks late-session
     technique into the training set.
+
+    `held_dir` (the default) makes that split CROSS-SESSION instead: `demo_dir`
+    supplies the fit episodes, `held_dir` the held-out ones, `n_fit` is then
+    determined by the directories and must not be passed.  This is the current
+    E10 setup -- 27 fit episodes from the 2026-09-03 session, the original 10
+    from 2026-09-02 held out in full.  Pass `held_dir=None` to recover the old
+    single-directory prefix split.
+
+    `n_fit_max` keeps only the first n fit episodes (the held-out set is never
+    truncated).  This is what the demo-count ablation
+    (`iosp.experiments.e10_demo_ablation`) varies, and it TRUNCATES rather than
+    down-weighting because the forward map solves every episode in the batch:
+    a zero loss weight would still pay for that episode's four segment solves,
+    so a weighted mask makes the n=1 fit cost exactly as much as the n=27 one.
+    MEASURED on this model at 27 fit + 10 held: one `value_and_grad` is 39 s
+    and one loss evaluation 44 s, so the 27-point sweep is ~300 GPU-hours
+    masked against ~14x a single fit truncated.  The price of truncating is a
+    rebuild (~2 min) and a recompile per n, which is noise against either.
     """
     if space not in ("ee", "joint"):
         raise ValueError(f"space must be 'ee' or 'joint', got {space!r}")
@@ -292,7 +399,33 @@ def build_teleop(demo_dir=DEFAULT_DEMO_DIR, teleop_root=DEFAULT_TELEOP_ROOT,
     # RNEA effort residuals are O(1e3-1e4) against O(1e-2) for path, and the
     # duration scalar sits among 42 waypoint variables with very different
     # curvature.  The forward solve costs ~10x accordingly.
-    names, demo_q, scenes = load_demos(demo_dir, teleop_root)
+    if held_dir is not None:
+        # Cross-session split.  `n_fit` is not a free parameter here -- it is
+        # however many episodes the fit directory holds -- so a caller passing
+        # one is contradicting the directories and gets an error rather than a
+        # silently ignored argument.
+        if n_fit is not None:
+            raise ValueError("n_fit is determined by `held_dir`; pass one or "
+                             "the other, not both")
+        # Both sides accept a directory, a list of directories, or an explicit
+        # list of episode directories -- which is what lets the fit set draw
+        # from BOTH sessions (see `mixed_split`).
+        fit_eps = find_episodes(demo_dir)
+        if n_fit_max is not None:
+            if not 0 < int(n_fit_max) <= len(fit_eps):
+                raise ValueError(f"n_fit_max must be in (0, {len(fit_eps)}]; "
+                                 f"got {n_fit_max}")
+            fit_eps = fit_eps[: int(n_fit_max)]
+        n_fit = len(fit_eps)
+        # Episode directories, not parent directories: `find_episodes` accepts
+        # either, and passing the truncated list is what makes the fit set an
+        # exact prefix without copying or symlinking anything.
+        demo_dir = fit_eps + find_episodes(held_dir)
+    elif n_fit_max is not None:
+        raise ValueError("n_fit_max needs `held_dir` (it truncates the fit "
+                         "directory); use n_fit for a single-directory split")
+    names, demo_q, scenes, episode_paths = load_demos(demo_dir, teleop_root,
+                                                      return_paths=True)
     B = len(names)
     n_fit = B - max(1, B // 4) if n_fit is None else int(n_fit)
     if not 0 < n_fit < B:
@@ -310,7 +443,8 @@ def build_teleop(demo_dir=DEFAULT_DEMO_DIR, teleop_root=DEFAULT_TELEOP_ROOT,
     forward_solver = (pp.make_stock_forward_solver(n_iters=n_iters) if fast_forward
                       else pp.make_composed_forward_solver(n_iters=n_iters))
 
-    K = pp.K_IK + pp.K_TRAJOPT
+    K_traj = pp.K_TRAJOPT_PERSEG if per_segment else pp.K_TRAJOPT
+    K = pp.K_IK + K_traj
     standoffs = measure_standoffs(prob, demo_q, scenes, fit_idx)
     print(f"  [teleop] standoff prior from the {n_fit} fit episodes: "
           f"grasp {standoffs[0]:.4f} m, place {standoffs[1]:.4f} m "
@@ -413,36 +547,22 @@ def build_teleop(demo_dir=DEFAULT_DEMO_DIR, teleop_root=DEFAULT_TELEOP_ROOT,
     else:
         theta_ik_pinned = None
 
+    _nf = pp.N_FEAT_PER_SEG
+
     def _weights(z_traj):
-        w = jax.nn.softmax(z_traj)
-        if False:  # upright_floor: retired with the `upright` weight
-            # RENORMALIZED.  The previous version raised the upright entry in
-            # place and left the rest alone, so the weights no longer summed to
-            # 1 and the floor was an ABSOLUTE weight no amount of fitting could
-            # outrank: at the uniform init it sat at 0.25 against ~0.09 for
-            # every other feature, and the only way any method could reduce it
-            # was to drive one smoothness logit to the simplex corner and swamp
-            # it (measured: that is exactly and only what CMA-ES found).  Worse,
-            # a constant entry has zero gradient through the softmax except via
-            # the denominator, so the floored coordinate's gradient collapsed to
-            # the generic value shared by every inert feature -- the fit could
-            # not see the term it was being forced to pay.  Rescaling the
-            # remaining mass keeps the floor a genuine lower bound on a SHARE
-            # while leaving the simplex intact.
-            w = w.at[UPRIGHT_IDX].set(jnp.maximum(w[UPRIGHT_IDX], upright_floor))
-            others = jnp.delete(jnp.arange(w.shape[0]), UPRIGHT_IDX,
-                                assume_unique_indices=True)
-            rest = w[others]
-            w = w.at[others].set(rest * (1.0 - w[UPRIGHT_IDX])
-                                 / jnp.maximum(rest.sum(), 1e-12))
-        return w
+        if per_segment:
+            return jnp.concatenate([jax.nn.softmax(z_traj[i * _nf:(i + 1) * _nf])
+                                    for i in range(len(pp.PHASES))])
+        return jax.nn.softmax(z_traj)
+
+    _do_split = _split_trajopt_perseg if per_segment else _split_trajopt
 
     def _rollout(u):
         z = z_of(u)
         theta_ik = theta_ik_pinned if theta_ik_pinned is not None else z[: pp.K_IK]
         z_traj = z[pp.K_IK:]
         x0, _, _, _ = prob.seeds(scenes, theta_ik)
-        _, _, xs, ps = prob.solve(theta_ik, _split_trajopt(_weights(z_traj)),
+        _, _, xs, ps = prob.solve(theta_ik, _do_split(_weights(z_traj)),
                                   scenes, inner, x0)
         return xs, ps
 
@@ -478,7 +598,7 @@ def build_teleop(demo_dir=DEFAULT_DEMO_DIR, teleop_root=DEFAULT_TELEOP_ROOT,
     ee_demo = jax.vmap(prob.ee_positions)(demo_q)
 
     screen_stationarity(prob, fit_scenes, inner, z_of(jnp.zeros(K))[: pp.K_IK],
-                        _split_trajopt(jax.nn.softmax(jnp.zeros(pp.K_TRAJOPT))),
+                        _do_split(_weights(jnp.zeros(K_traj))),
                         "teleop (path A, human demos)")
 
     def loss_a(u):
@@ -524,6 +644,9 @@ def build_teleop(demo_dir=DEFAULT_DEMO_DIR, teleop_root=DEFAULT_TELEOP_ROOT,
         ik = np.asarray(theta_ik_pinned) if theta_ik_pinned is not None else z[: pp.K_IK]
         return np.concatenate([ik, np.asarray(_weights(jnp.asarray(z[pp.K_IK:])))])
 
+    _traj_names = (list(pp.THETA_TRAJOPT_PERSEG_NAMES) if per_segment
+                   else list(pp.THETA_TRAJOPT_NAMES))
+
     return dict(
         gf=jax.jit(jax.value_and_grad(loss_a)),
         # Value-only loss: FD/CMA-ES need the loss VALUE, never its gradient.
@@ -545,7 +668,11 @@ def build_teleop(demo_dir=DEFAULT_DEMO_DIR, teleop_root=DEFAULT_TELEOP_ROOT,
         # No ground-truth cost exists for a human demonstrator: `run_procedure`
         # skips every parameter-space metric on `theta_star is None`.
         theta_star=None, u_star=None,
-        names=list(pp.THETA_IK_NAMES) + list(pp.THETA_TRAJOPT_NAMES),
-        episodes=names, n_fit=n_fit, fit_idx=fit_idx, gen_idx=gen_idx,
+        names=list(pp.THETA_IK_NAMES) + _traj_names,
+        episodes=names, episode_paths=[str(d) for d in episode_paths],
+        n_fit=n_fit, fit_idx=fit_idx, gen_idx=gen_idx,
         scenes=scenes, demo_q=demo_q, prob=prob,
     )
+
+
+build_teleop = build_pick_and_place

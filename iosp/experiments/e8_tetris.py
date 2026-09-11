@@ -29,13 +29,31 @@ from ioc.inner import make_inner_solver
 from iosp.model import tetris as tt
 from iosp.config import URDF_PATH, SRDF_PATH, MESH_DIR
 
-Z_STAR = jnp.array([0.5, 1.5, 1.0, 0.8, 1.0, 2.0], dtype=jnp.float32)  # ...,orient,torque,skeleton
+# effort/smooth raised from (0.5, 1.5) after scoring EXECUTED rollouts with
+# `iosp.checks.dynamic_report`: at the old weights effort carried only 0.078 of
+# the softmax against skeleton's 0.349, which left the free interior of the
+# carry phase unpriced.  The plan then bulged the EE to 1.15 m -- past joint2's
+# and joint6's hard stops by up to 45 deg -- while still hitting the pinned
+# rows exactly, so every purely kinematic check passed.  At (3.5, 2.5) the
+# overshoot is 0.0 deg and reach is unchanged.
+# `held` sits between clearance and orient.  It is the CARRIED BLOCK's
+# clearance, which this model had no term for at all: the arm's own clearance
+# says nothing about the block in its gripper, so a plan sweeping the block
+# through a goal wall cost zero.  SPaSM's trajopt weights the equivalent term
+# 240x its arm-collision weight (1.20 vs 0.005), so it starts high here too.
+Z_STAR = jnp.array([3.5, 2.5, 1.0, 3.0, 0.8, 1.0, 2.0], dtype=jnp.float32)  # ...,held,orient,torque,skeleton
 PARAM_NAMES = list(tt.FEATURE_NAMES)
 
 
-def build(seed=0, n_iters=60, n_scenes=6, num_blocks=1):
+def build(seed=0, n_iters=60, n_scenes=6, num_blocks=3):
     prob = tt.TetrisProblem.load(str(URDF_PATH), str(SRDF_PATH), str(MESH_DIR))
-    fs = tt.make_tetris_forward_solver(n_iters=n_iters, robot=prob.base.robot)
+    # IOSP_STOCK_SOLVER=1 swaps the fixed-length unroll for the stock
+    # early-stopping `while_loop`.  The unroll exists only to make q*(theta)
+    # differentiable for the bilevel outer loop; for forward-only iteration it
+    # is pure compile-time cost.
+    stock = os.environ.get("IOSP_STOCK_SOLVER", "0") == "1"
+    fs = tt.make_tetris_forward_solver(n_iters=n_iters, robot=prob.base.robot,
+                                       stock=stock)
 
     rng = np.random.default_rng(seed)
     scenes_all = tt.sample_tetris_scenes(rng, 2 * n_scenes, num_blocks=num_blocks)
@@ -57,12 +75,13 @@ def build(seed=0, n_iters=60, n_scenes=6, num_blocks=1):
         fit.obs_center, fit.obs_radius,
         prob.pick_ik(fit.pick_pos, fit.q_start),
         prob.place_ik(fit.place_pos,
-                      prob.pick_ik(fit.pick_pos, fit.q_start)))
+                      prob.pick_ik(fit.pick_pos, fit.q_start)),
+        fit.block_spheres)
     full_scales = prob.calibrate_full(full_rf, full_sc, key)
     refine = make_inner_solver(full_rf, full_scales, forward_solver=fs)
 
     return dict(prob=prob, fit=fit, test=test, inner_by_phase=inner_by_phase,
-                refine=refine, fs=fs, seed=seed)
+                refine=refine, fs=fs, seed=seed, full_scales=full_scales)
 
 
 def ee_paths(built, scenes, z, *, stage2=True):
@@ -102,7 +121,7 @@ def fit_z(loss_and_grad, starts, *, lr=0.05, n_steps=40):
 
 
 def run(seed=0, n_iters=60, n_scenes=6, n_steps=40, n_starts=8,
-        num_blocks=1, out=None):
+        num_blocks=3, out=None):
     t_wall_start = time.perf_counter()
     t0 = time.perf_counter()
     built = build(seed=seed, n_iters=n_iters, n_scenes=n_scenes,

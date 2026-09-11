@@ -50,7 +50,7 @@ def main():
     ap = argparse.ArgumentParser()
     here = pathlib.Path(__file__).resolve().parents[1]
     ap.add_argument("--summary", type=str,
-                    default=str(here / "data" / "results" / "e10_methods_principled"
+                    default=str(here / "data" / "results" / "e10_methods"
                                 / "summary.json"))
     ap.add_argument("--out", type=str,
                     default=str(here / "figures" / "e10_method_comparison.tex"))

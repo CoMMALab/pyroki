@@ -55,7 +55,7 @@ def build(seed=0, n_iters=60, n_branches=4, scene_b_scale=1.0, z_prior=None):
     # adjoint, over the full concatenated trajectory.  Uses fewer L-BFGS
     # iterations than the per-segment solver: the refine starts from stage 1's
     # warm output, so it converges faster.
-    refine_fs = pp.make_composed_forward_solver(n_iters=min(n_iters, 20))
+    refine_fs = pp.make_composed_forward_solver(n_iters=min(n_iters, 20), robot=prob.base.robot)
     full_residual_fn = prob.full_residual_fn()
     full_sc_cal = prob.full_scenes(
         scene_a(),
@@ -118,9 +118,7 @@ def build(seed=0, n_iters=60, n_branches=4, scene_b_scale=1.0, z_prior=None):
             "transport": pp.Scene(q_pick, q_place, sc.obs_center, sc.obs_radius),
             "place": pp.Scene(q_place, q_place, sc.obs_center, sc.obs_radius),
         }
-        tt = {p: rep(theta_tr[:, i:i + len(pp.SEGMENT_FEATURES[p])])
-              for p, i in zip(pp.PHASES, np.cumsum(
-                  [0] + [len(pp.SEGMENT_FEATURES[q]) for q in pp.PHASES])[:-1])}
+        tt = {p: rep(theta_tr) for p in pp.PHASES}
 
         # -- phase 1: per-segment solves (pyroffi dynamics-aware + implicit) --
         xs = {}
@@ -212,7 +210,7 @@ def build_from_demos(demo_dir=None, teleop_root=None, n_fit=None, seed=0,
     fit_idx, gen_idx = np.arange(n_fit), np.arange(n_fit, M)
     fit_scenes = jax.tree.map(lambda a: a[fit_idx], scenes)
 
-    fs = pp.make_composed_forward_solver(n_iters=n_iters)
+    fs = pp.make_composed_forward_solver(n_iters=n_iters, robot=prob.base.robot)
 
     K = pp.K_IK + pp.K_TRAJOPT + pp.K_FULL
     S = s3.z_scale(pp.K_IK + pp.K_TRAJOPT, pp.K_IK)
@@ -230,7 +228,7 @@ def build_from_demos(demo_dir=None, teleop_root=None, n_fit=None, seed=0,
     # calibration, for the same reason: a scale fitted on the held-out episodes
     # lets them re-normalise the very features being tested.
     inner, _ = s3._build_inner(prob, fit_scenes, theta_ik0, fs, seed)
-    refine_fs = pp.make_composed_forward_solver(n_iters=min(n_iters, 20))
+    refine_fs = pp.make_composed_forward_solver(n_iters=min(n_iters, 20), robot=prob.base.robot)
     full_residual_fn = prob.full_residual_fn()
     q_pick_cal = prob.grasp_ik(theta_ik0, fit_scenes)
     full_sc_cal = prob.full_scenes(fit_scenes, q_pick_cal,
@@ -288,9 +286,7 @@ def build_from_demos(demo_dir=None, teleop_root=None, n_fit=None, seed=0,
             "transport": pp.Scene(q_pick, q_place, sc.obs_center, sc.obs_radius),
             "place": pp.Scene(q_place, q_place, sc.obs_center, sc.obs_radius),
         }
-        tt = {p: rep(theta_tr[:, i:i + len(pp.SEGMENT_FEATURES[p])])
-              for p, i in zip(pp.PHASES, np.cumsum(
-                  [0] + [len(pp.SEGMENT_FEATURES[q]) for q in pp.PHASES])[:-1])}
+        tt = {p: rep(theta_tr) for p in pp.PHASES}
 
         xs = {}
         for p in pp.PHASES:

@@ -201,8 +201,23 @@ def split_trajopt(theta_trajopt):
     return {p: theta_trajopt for p in PHASES}
 
 
+def split_trajopt_perseg(theta_trajopt):
+    """Flat (K_TRAJOPT_PERSEG,) weight vector -> {phase: weights}.
+
+    Per-segment variant: the first N_FEAT entries go to approach, the next N_FEAT
+    to grasp, etc.  Each phase gets its own independent weight block.
+    """
+    nf = len(STANDARD_FEATURES)
+    return {p: theta_trajopt[i * nf:(i + 1) * nf] for i, p in enumerate(PHASES)}
+
+
 THETA_TRAJOPT_NAMES = STANDARD_FEATURES
 K_TRAJOPT = len(THETA_TRAJOPT_NAMES)
+
+N_FEAT_PER_SEG = len(STANDARD_FEATURES)
+K_TRAJOPT_PERSEG = N_FEAT_PER_SEG * len(PHASES)
+THETA_TRAJOPT_PERSEG_NAMES = tuple(
+    f"{p}.{f}" for p in PHASES for f in STANDARD_FEATURES)
 # The release point is NOT the bucket's axis.  MEASURED on the teleop set: every
 # one of ten operators let go 6.3 cm SHORT of the bucket centre, toward the arm
 # base (std 1.8 cm), plus 1.6 cm tangentially -- i.e. over the NEAR RIM, the
@@ -426,7 +441,7 @@ def make_stock_forward_solver(n_iters=60):
     keep the fixed-length soft forward (`make_composed_forward_solver`)."""
     from pyroffi.optimization_engines import DynamicsTrajOptConfig, dynamics_trajopt
 
-    cfg = DynamicsTrajOptConfig(n_iters=n_iters)  # stock: early_stop=True, hard flags
+    cfg = DynamicsTrajOptConfig(n_iters=n_iters)
 
     def forward_solver(x0, cost_fn):
         return dynamics_trajopt(x0, cost_fn, cfg)
@@ -589,6 +604,8 @@ class FullScene:
     obs_center: jnp.ndarray  # (3,)
     obs_radius: jnp.ndarray  # (1,)
     q_pick: jnp.ndarray  # (dof,)
+    obs_spheres: jnp.ndarray = None  # (M, 4) xyz+radius, or None
+    table_box: jnp.ndarray = None  # (6,) center+half-extents, or None
 
 
 # A square cube's parallel-jaw grasp repeats every 90 deg, so a target yaw and

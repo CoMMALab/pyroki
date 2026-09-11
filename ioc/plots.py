@@ -174,8 +174,9 @@ def finish(fig, name):
     print(f"  wrote figures/{name}.pdf|png")
 
 
-def panel_label(ax, text, dx=-0.16, dy=1.04):
-    ax.text(dx, dy, text, transform=ax.transAxes, fontsize=8, fontweight="bold",
+def panel_label(ax, text, dx=-0.16, dy=1.04, fontsize=None):
+    ax.text(dx, dy, text, transform=ax.transAxes,
+            fontsize=8 if fontsize is None else fontsize, fontweight="bold",
             va="top", ha="left")
 
 
@@ -190,6 +191,52 @@ def solves_to(trace, target):
     return next((s for s, l in trace if l < target), None)
 
 
+# --- shared layout for the single-column line figures (fig. 1, fig. 4) -------
+# Both figures carry 4-8 series on a 3.5 in column: no in-axes corner is large
+# enough to hold the key without covering curves or IQR bands, and inflating
+# the data range to manufacture one wastes the panel.  So the key goes outside,
+# under the axes, and the layout is constrained rather than tight -- only the
+# constrained engine measures the suptitle and an outside legend, so the gaps
+# above and below the axes come out the same on both figures instead of being
+# hand-tuned per figure.
+#
+# One order for every line figure's series, so a reader moving between fig. 1
+# and fig. 4 finds a method in the same slot of the key with the same colour,
+# marker and dash pattern.  Curves are drawn in the reverse of this order,
+# which puts the primary series on top of the baselines it is compared against.
+LEGEND_ORDER = ("implicit", "unrolled", "fd", "cmaes",
+                "kkt", "cioc", "eiv", "random")
+
+
+def draw_order(methods):
+    """`methods` sorted so the topmost drawn curve is the key's first entry."""
+    return [m for m in reversed(LEGEND_ORDER) if m in methods]
+
+
+def line_figure(height):
+    """A single-column line-figure axes laid out for a title and outside key."""
+    fig, ax = plt.subplots(1, 1, figsize=(COL1, height), layout="constrained")
+    fig.get_layout_engine().set(w_pad=0.03, h_pad=0.05)
+    return fig, ax
+
+
+def line_figure_finish(fig, ax, methods, title, name, ncol=2):
+    """Title, legend and save, shared by fig. 1 and fig. 4.
+
+    `methods` fixes the legend order (STYLE keys); entries absent from the axes
+    -- a method missing from the collected data -- are skipped rather than
+    faked, so the key never advertises a curve that was not drawn.
+    """
+    got = {lab: h for h, lab in zip(*ax.get_legend_handles_labels())}
+    keys = [m for m in LEGEND_ORDER if m in methods and STYLE[m]["label"] in got]
+    fig.suptitle(title, fontsize=9, fontweight="bold")
+    fig.legend([got[STYLE[m]["label"]] for m in keys],
+               [STYLE[m]["label"] for m in keys],
+               loc="outside lower center", ncol=ncol, frameon=False,
+               handlelength=2.2, columnspacing=1.2, handletextpad=0.5)
+    finish(fig, name)
+
+
 # ---------------------------------------------------------------------------
 # Fig. 1 - cost of a fit vs cost dimension  (the main result)
 # ---------------------------------------------------------------------------
@@ -201,7 +248,7 @@ def fig_scaling():
     if not files:
         print("  [skip] no segments sweep data")
         return
-    METHODS = ("implicit", "unrolled", "fd", "cmaes", "kkt", "cioc", "eiv", "random")
+    METHODS = ("implicit", "unrolled", "fd", "cmaes")
     Ks = []
     series = {m: [] for m in METHODS}
     lo = {m: [] for m in METHODS}
@@ -238,9 +285,8 @@ def fig_scaling():
     else:
         print("  [fig1] no censoring: every seed reached the target")
 
-    fig, ax = plt.subplots(1, 1, figsize=(COL1, 2.5))
-    plot_order = ("random", "eiv", "cioc", "kkt", "fd", "cmaes", "unrolled", "implicit")
-    for m in plot_order:
+    fig, ax = line_figure(2.5)
+    for m in draw_order(METHODS):
         st = STYLE[m]
         ax.plot(Ks, series[m], marker=st["marker"], ls=st["ls"], color=st["color"],
                 label=st["label"], clip_on=False, zorder=3)
@@ -248,16 +294,13 @@ def fig_scaling():
     ax.set_xlabel("cost parameters $K$")
     ax.set_ylabel(r"solves to reach $L<10^{-2}$")
     ax.set_xticks(Ks)
+    # Keep the K=6 and K=48 markers off the spines; `clip_on=False` would
+    # otherwise draw them half outside the frame.
+    ax.margins(x=0.06)
     tidy(ax)
-    h, l = ax.get_legend_handles_labels()
-    legend_order = ("implicit", "unrolled", "fd", "cmaes", "kkt", "cioc", "eiv", "random")
-    order = [l.index(STYLE[m]["label"])
-             for m in legend_order if STYLE[m]["label"] in l]
-    ax.legend([h[i] for i in order], [l[i] for i in order], loc="upper left", ncol=2, fontsize=6.5)
-    fig.suptitle("Sample Efficiency vs. Cost Dimension", fontsize=9, y=1.0,
-                fontweight="bold")
-    fig.tight_layout()
-    finish(fig, "fig1_scaling")
+    line_figure_finish(fig, ax, METHODS,
+                       "Sample Efficiency vs. Cost Dimension",
+                       "fig1_scaling", ncol=2)
 
 
 # ---------------------------------------------------------------------------
@@ -1270,8 +1313,8 @@ def fig_noise():
     floor = 1e-7  # KKT is exact at sigma=0 (regret ~1e-19); an unclipped log
     # axis would span 12 decades of empty space and crush the informative range.
 
-    fig, ax = plt.subplots(1, 1, figsize=(COL1, 2.4))
-    for m in methods:
+    fig, ax = line_figure(3.0)
+    for m in draw_order(methods):
         # Skip methods absent from the data (e.g. "eiv" before re-collection).
         if any(m not in t["methods"] for s in sig for t in rows[s].values()):
             continue
@@ -1287,12 +1330,11 @@ def fig_noise():
     ax.set_xlabel(r"demonstration noise $\sigma$ [rad]")
     ax.set_ylabel(r"$\|\hat\theta-\theta^\star\|_1$")
     ax.set_xticks(sig)
+    ax.margins(x=0.06)
     tidy(ax)
-    ax.legend(loc="upper left", ncol=2, fontsize=6.5)
-    fig.suptitle("Weight Recovery vs. Demonstration Noise (Robot)",
-                fontsize=9, y=1.03, fontweight="bold")
-    fig.tight_layout()
-    finish(fig, "fig4_noise_robot")
+    line_figure_finish(fig, ax, methods,
+                       "Weight Recovery vs. Demonstration Noise (Robot)",
+                       "fig4_noise_robot", ncol=2)
 
 
 # ---------------------------------------------------------------------------
@@ -1333,54 +1375,82 @@ def fig_kkt_seed():
     Rs = sorted({k[1] for k in parsed})
     sigmas = sorted({k[2] for k in parsed})
 
-    regime_name = {bws[0]: "wide bumps, unimodal", bws[1]: "narrow bumps, multimodal"}
+    regime_name = {bws[0]: "wide bumps\n(unimodal)", bws[1]: "narrow bumps\n(multimodal)"}
 
-    fig, axes = plt.subplots(len(bws), len(Rs), figsize=(COL2, 2.5 * len(bws)),
-                              squeeze=False, sharex=True)
-    for i, bw in enumerate(bws):
-        for j, R in enumerate(Rs):
-            ax = axes[i][j]
-            meds = {}
-            for arm in ("random", "kkt_seed"):
-                st = _KKT_SEED_STYLE[arm]
-                vals = [[t["arms"][arm]["l1"] for t in parsed[(bw, R, s)].values()]
-                        for s in sigmas if (bw, R, s) in parsed]
-                med = np.array([np.median(v) for v in vals])
-                q1 = np.array([np.percentile(v, 25) for v in vals])
-                q3 = np.array([np.percentile(v, 75) for v in vals])
-                meds[arm] = med
-                ax.plot(sigmas, med, marker=st["marker"], ls=st["ls"],
-                        color=st["color"], label=st["label"], clip_on=False, zorder=3)
-                ax.fill_between(sigmas, q1, q3, color=st["color"], alpha=0.15,
-                                 lw=0, zorder=2)
-            ax.set_xticks(sigmas)
-            tidy(ax)
-            # Headline number per panel: the noiseless-case speedup, where the
-            # comparison is cleanest.  Placed in the low corner shared by both
-            # curves' right tail, which stays clear across all four panels.
-            gain = meds["random"][0] / meds["kkt_seed"][0]
-            ax.text(0.97, 0.06, rf"${gain:,.0f}\times$ at $\sigma{{=}}0$",
-                    transform=ax.transAxes, ha="right", va="bottom", fontsize=6.5,
-                    color=_KKT_SEED_STYLE["kkt_seed"]["color"],
-                    bbox=dict(boxstyle="round,pad=0.2", fc="white", ec="none", alpha=0.85))
-            if i == 0:
-                ax.set_title(f"$R={R}$ restarts", fontsize=8)
-            if i == len(bws) - 1:
-                ax.set_xlabel(r"demonstration noise $\sigma$")
-            if j == 0:
-                ax.set_ylabel(r"$\|\hat\theta-\theta^\star\|_1$")
-    for i, bw in enumerate(bws):
-        y0 = axes[i][0].get_position().y0
-        y1 = axes[i][0].get_position().y1
-        fig.text(0.005, (y0 + y1) / 2, regime_name[bw], rotation=90,
-                  ha="left", va="center", fontsize=7.5)
-    handles, labels = axes[0][0].get_legend_handles_labels()
-    fig.legend(handles, labels, loc="upper center", ncol=2, fontsize=7,
-               bbox_to_anchor=(0.55, 0.94), frameon=False)
-    fig.suptitle("Inverse-KKT Seeding: A Head Start That Fades with Noise",
-                 fontsize=8.5, y=0.995, fontweight="bold")
-    fig.tight_layout(rect=(0.03, 0, 1, 0.88))
-    finish(fig, "fig4b_kkt_seed")
+    # This is the one double-column figure in the slate whose axes are a 2x2
+    # grid, so the column-figure point sizes set in `set_style()` come out
+    # roughly half the apparent size of fig. 1's when the panel is printed at
+    # 7.16 in.  Scale the text up locally -- same family, same weights, same
+    # palette -- so a reader moving between the figures sees one style at one
+    # legible size rather than two.
+    with plt.rc_context({
+        "font.size": 11.7,
+        "axes.labelsize": 12.5,
+        "axes.titlesize": 12.5,
+        "xtick.labelsize": 11,
+        "ytick.labelsize": 11,
+        "lines.linewidth": 1.6,
+        "lines.markersize": 4.6,
+    }):
+        # Constrained layout, as in fig. 1 and fig. 4: it is the only engine
+        # that measures the suptitle and the outside key, so the gaps above and
+        # below the grid come out matched instead of hand-tuned.
+        fig, axes = plt.subplots(len(bws), len(Rs), figsize=(COL2, 2.15 * len(bws)),
+                                 squeeze=False, sharex=True, sharey="row",
+                                 layout="constrained")
+        fig.get_layout_engine().set(w_pad=0.03, h_pad=0.05, wspace=0.03, hspace=0.04)
+        for i, bw in enumerate(bws):
+            for j, R in enumerate(Rs):
+                ax = axes[i][j]
+                meds = {}
+                for arm in ("random", "kkt_seed"):
+                    st = _KKT_SEED_STYLE[arm]
+                    vals = [[t["arms"][arm]["l1"] for t in parsed[(bw, R, s)].values()]
+                            for s in sigmas if (bw, R, s) in parsed]
+                    med = np.array([np.median(v) for v in vals])
+                    q1 = np.array([np.percentile(v, 25) for v in vals])
+                    q3 = np.array([np.percentile(v, 75) for v in vals])
+                    meds[arm] = med
+                    ax.plot(sigmas, med, marker=st["marker"], ls=st["ls"],
+                            color=st["color"], label=st["label"], clip_on=False,
+                            zorder=3)
+                    ax.fill_between(sigmas, q1, q3, color=st["color"], alpha=0.15,
+                                    lw=0, zorder=2)
+                ax.set_xticks(sigmas)
+                ax.margins(x=0.06)
+                tidy(ax)
+                panel_label(ax, "(" + "abcdefgh"[i * len(Rs) + j] + ")",
+                            dx=-0.13 if j == 0 else -0.04, dy=1.10, fontsize=13)
+                # Headline number per panel: the noiseless-case ratio, where the
+                # comparison is cleanest.  Placed in the low corner shared by
+                # both curves' right tail, which stays clear across all panels.
+                gain = meds["random"][0] / meds["kkt_seed"][0]
+                txt = rf"${gain:.1f}\times$ at $\sigma{{=}}0$" if gain < 10 else \
+                      rf"${gain:,.0f}\times$ at $\sigma{{=}}0$"
+                ax.text(0.97, 0.06, txt, transform=ax.transAxes, ha="right",
+                        va="bottom", fontsize=11, fontweight="bold",
+                        color=_KKT_SEED_STYLE["kkt_seed"]["color"],
+                        bbox=dict(boxstyle="round,pad=0.25", fc="white", ec="none",
+                                  alpha=0.85))
+                if i == 0:
+                    ax.set_title(f"$R={R}$ restart" + ("s" if R != 1 else ""))
+                if i == len(bws) - 1:
+                    ax.set_xlabel(r"demonstration noise $\sigma$ [rad]")
+                if j == 0:
+                    ax.set_ylabel(r"$\|\hat\theta-\theta^\star\|_1$")
+                    # Row label rides outside the y-axis label in axes
+                    # coordinates rather than figure coordinates, so it tracks
+                    # the row wherever the layout engine puts it.
+                    ax.text(-0.30, 0.5, regime_name[bw], transform=ax.transAxes,
+                            rotation=90, ha="center", va="center", fontsize=12.5,
+                            fontweight="bold")
+        handles, labels = axes[0][0].get_legend_handles_labels()
+        fig.suptitle(r"Weight Recovery vs. Demonstration Noise: KKT-Seeded vs. Random $z_0$",
+                     fontsize=14, fontweight="bold")
+        fig.legend(handles, labels, loc="outside lower center", ncol=2,
+                   fontsize=12.5, frameon=False, handlelength=2.4,
+                   columnspacing=1.6, handletextpad=0.5)
+        finish(fig, "fig4b_kkt_seed")
 
 
 def fig_kkt_seed_trace():

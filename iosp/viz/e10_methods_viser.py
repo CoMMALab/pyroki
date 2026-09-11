@@ -29,7 +29,7 @@ Nothing is re-fitted here: joint paths come from the saved
 Usage:
     PYTHONPATH=. python -m iosp.viz.e10_methods_viser --episode-index 0
     PYTHONPATH=. python -m iosp.viz.e10_methods_viser \
-        --results-dir iosp/data/results/e10_methods_principled --episode-index 9
+        --results-dir iosp/data/results/e10_methods --episode-index 9
 """
 import argparse
 import json
@@ -41,7 +41,7 @@ import numpy as np
 from iosp.viz import e10_teleop_viser as tv   # also sets FR3_MJCF + sys.path
 
 DEFAULT_RESULTS = (pathlib.Path(__file__).resolve().parents[1]
-                   / "data" / "results" / "e10_methods_principled")
+                   / "data" / "results" / "e10_methods")
 
 # Hue per method: (robot rgb, cube rgb).  The cube is the saturated end of the
 # same hue as its arm, so the pairing is readable without a legend while the
@@ -608,6 +608,8 @@ def main():
         nonlocal ctx
         import mjviser
         i = labels.index(ep_dropdown.value)
+        if i == ctx["episode_index"]:
+            return
         ensure_init(i)
         ctx = build_ctx(args.demo_dir, episodes[i], i, methods, paths,
                         args.spacing, sched_kw, demo_source=args.demo_source)

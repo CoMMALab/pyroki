@@ -51,7 +51,7 @@ from iosp import config
 config.enable_compilation_cache()
 
 from iosp.fit.procedure import _report, run_procedure
-from iosp.fit.teleop import DEFAULT_DEMO_DIR, build_teleop
+from iosp.fit.teleop import FIT_DEMO_DIR, TEST_DEMO_DIR, build_teleop
 from iosp.model import pickplace as pp
 
 
@@ -117,9 +117,12 @@ def run_multistart(demo_dir, n_fit, seed, n_iters, n_steps, lr,
 
 
 def run_procedure_mode(demo_dir, n_fit, seed, n_iters, n_steps, lr, space,
-                       n_restarts=1, out=None):
+                       n_restarts=1, held_dir=TEST_DEMO_DIR, out=None):
     """E3's five-stage identifiable refit, on the same demonstrations."""
-    built = build_teleop(demo_dir=demo_dir, n_fit=n_fit, seed=seed,
+    # `held_dir` set (the default) makes the split cross-session and fixes
+    # `n_fit` at the fit directory's episode count, so `n_fit` must be None.
+    built = build_teleop(demo_dir=demo_dir, held_dir=held_dir,
+                         n_fit=(None if held_dir else n_fit), seed=seed,
                          n_iters=n_iters, n_restarts=n_restarts, space=space)
     print(f"E10: {len(built['episodes'])} teleop episodes, "
           f"{built['n_fit']} fit / {len(built['gen_idx'])} held out, "
@@ -165,7 +168,7 @@ def _write(out, payload):
     print(f"\nwrote {out}")
 
 
-def main(demo_dir=DEFAULT_DEMO_DIR, n_fit=None, seed=0, n_iters=config.N_ITERS,
+def main(demo_dir=FIT_DEMO_DIR, held_dir=TEST_DEMO_DIR, n_fit=None, seed=0, n_iters=config.N_ITERS,
          n_steps=config.N_STEPS, lr=config.LR, space="joint", n_restarts=1,
          mode="multistart", n_branches=4, n_starts=3, chunk=4, out=None):
     stem = (out or "").rsplit(".", 1)[0]
@@ -177,13 +180,16 @@ def main(demo_dir=DEFAULT_DEMO_DIR, n_fit=None, seed=0, n_iters=config.N_ITERS,
     if mode in ("procedure", "both"):
         res["procedure"] = run_procedure_mode(
             demo_dir, n_fit, seed, n_iters, n_steps, lr, space, n_restarts,
-            out=(f"{stem}_procedure.json" if mode == "both" else out))
+            held_dir=held_dir, out=(f"{stem}_procedure.json" if mode == "both" else out))
     return res
 
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--demo-dir", default=str(DEFAULT_DEMO_DIR))
+    ap.add_argument("--demo-dir", default=str(FIT_DEMO_DIR))
+    ap.add_argument("--held-dir", default=str(TEST_DEMO_DIR),
+                    help="held-out episode dir; '' for the old "
+                         "single-directory prefix split")
     ap.add_argument("--n-fit", type=int, default=None)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--n-iters", type=int, default=config.N_ITERS)
@@ -199,7 +205,7 @@ if __name__ == "__main__":
                     help="candidates evaluated at once (memory only; exact)")
     ap.add_argument("--out", default="iosp/data/e10_teleop.json")
     a = ap.parse_args()
-    main(demo_dir=a.demo_dir, n_fit=a.n_fit, seed=a.seed, n_iters=a.n_iters,
+    main(demo_dir=a.demo_dir, held_dir=(a.held_dir or None), n_fit=a.n_fit, seed=a.seed, n_iters=a.n_iters,
          n_steps=a.steps, lr=a.lr, space=a.space, n_restarts=a.n_restarts,
          mode=a.mode, n_branches=a.n_branches, n_starts=a.n_starts,
          chunk=a.chunk, out=a.out)

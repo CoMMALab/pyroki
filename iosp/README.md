@@ -95,6 +95,9 @@ refer to them; the old `study<n>` filenames map to the table above.
 | `checks/branch_classes` | How many *distinct* IK branches does this arm actually have here? |
 | `checks/composed_fd` | Do the single-segment soft-flag findings carry to the composed chain? |
 | `checks/loss_rmse_consistency` | Is the rollout a stable function of `u`? (The G0 gate — catches disagreements stationarity screening misses.) |
+| `checks/forward_extract` | Extract joint paths at `u=0` for all three domains → `.npz`. |
+| `checks/dynamic_report` | Drive those `.npz` paths through MuJoCo physics and score task success. |
+| `checks/pickplace_sim` | Standalone FR3 pickplace build + physics test (no `.npz` intermediate). |
 
 ## Reproducing the current results
 
@@ -134,6 +137,205 @@ python -m iosp.analysis.multiseed             # prints stage A and stage B table
 ```
 
 `IOSP_RESULTS=<dir>` repoints the aggregator if you keep results elsewhere.
+
+## Human teleoperation reconstruction
+
+`e10_method_comparison` fits the composed planner to **human** GELLO teleop
+episodes and compares the outer-loop methods on it. There is no `theta_star`
+here, so every parameter-recovery metric is undefined and the claim is purely
+behavioural — read `E10_TELEOP.md` before changing anything in the pipeline.
+Run all of this in the `pyroffi` env (`pyroffi-tamp` if you need the CUDA FFI
+kernels; `spasm-pyroffi`'s JAX 0.8.0 cannot load them).
+
+### 1. Collect the demonstrations
+
+Recording lives in the sibling repo, not here:
+
+```bash
+cd ../sim_teleop
+python record.py --port /dev/ttyUSB0            # the real GELLO leader
+python record.py --mock                         # no hardware, scripted sweep
+```
+
+Browser viewer on `--viser-port` (default 8080) so it works over SSH. Three
+buttons: start, stop-and-save, stop-and-DISCARD. **Use discard freely** — about
+half of hand-teleoperated attempts fumble the grasp or knock the cube off the
+table, and a failed episode is not a noisy sample of the intended behaviour, it
+is a sample of *different* behaviour. Nothing hits disk until stop-and-save.
+
+Episodes land in `../sim_teleop/data/demos/ep_<timestamp>/`, each with
+`state.jsonl` (what the fit reads), `episode.npz` (velocities/torques, recorded
+but unread) and `factors.json` (the randomisation record — an episode without
+it can be replayed but not fitted). `sim_teleop/pickplace/iosp_export.py`
+collapses each to an `(N_FULL, 7)` waypoint path; it imports `N_FULL`/
+`PHASE_SPAN` from this package, so do not vendor a copy here.
+
+The current ten episodes are `ep_20260902_09*`, split 8 fit / 2 held-out
+chronologically.
+
+### 2. Fit
+
+The configuration behind the current per-segment result:
+
+```bash
+CUDA_VISIBLE_DEVICES=<idx> XLA_PYTHON_CLIENT_PREALLOCATE=false MUJOCO_GL=egl \
+  python -m iosp.experiments.e10_method_comparison \
+      --pin-ik bucket --free-space-only --per-segment \
+      --n-restarts 3 --n-starts 3 \
+      --methods implicit,fd,cmaes --compile-timeout 120 \
+      --out-dir iosp/data/results/e10_methods_perseg_r3_ms3
+```
+
+- `--per-segment` gives each of the 4 segments its own 6 weights: K=28 = 4
+  pinned `theta_ik` + 4x6. Without it, K=10 (one shared set of 6).
+- `--pin-ik bucket` makes the release/grasp events constraints instead of fitted
+  weights; `measured` fits better but releases on the rim (0/10).
+- `--n-restarts` is the *inner* solver restarts per segment; `--n-starts` is the
+  *outer* multistart, selected on TRAINING loss only.
+- `--methods` — drop `unrolled` unless you raise `--compile-timeout`; it hits
+  `compile_timeout` at 120 s and is written out as `diverged` with no theta.
+- Runtimes on the current data: implicit ~21 min, CMA-ES ~3.5 h, FD ~10 h.
+
+Writes `summary.json`, `joint_paths.npz`, `paths.npz`, `u_hats.npz`.
+`--out-dir` defaults to `iosp/data/results/e10_methods`, which overwrites — pass
+it explicitly for anything worth keeping.
+
+### 3. Visualize
+
+Side-by-side physics playback of every method's reconstruction in one MuJoCo
+scene, replayed from the saved `joint_paths.npz` (nothing is refitted):
+
+```bash
+MUJOCO_GL=egl PYTHONPATH=. python -m iosp.viz.e10_methods_viser \
+    --results-dir iosp/data/results/e10_methods_perseg_r3_ms3 \
+    --methods demo,fd,cmaes,implicit \
+    --episode-index 9 --port 8081
+```
+
+- **Set `--methods` to what the run actually contains.** The default order
+  includes `unrolled` and `init`; a missing method is dropped with a warning,
+  but `init` only resolves if some method's `u_hat` is exactly 0. When none is
+  (the usual case with `--n-starts > 1`), pass `--recompute-init` to roll the
+  baseline out here, which rebuilds the forward map and needs a GPU.
+- `--episode-index 0-9`; indices `>= summary["n_fit"]` (8, 9) are the held-out
+  demos, which are the interesting ones once rollout success saturates.
+- Pick a free `--port`; 8080 is often taken by another viser.
+- Robot and cube share a hue per method, so a failure reads as "the GREEN arm
+  dropped the GREEN cube on the table".
+
+### 4. Render the table
+
+```bash
+python -m iosp.analysis.make_e10_table \
+    --summary iosp/data/results/e10_methods_perseg_r3_ms3/summary.json \
+    --out iosp/figures/e10_perseg_r3_ms3.tex
+```
+
+Emits the joint/EE RMSE x fit/held-out block plus task success and wall clock;
+it reads K from the summary, so it is basis-agnostic (verified on both K=10 and
+K=28). Task success is the cube-in-bucket count under contact physics — a
+VERIFICATION metric, never part of the fitting loss. Note it saturates at 8/8,
+2/2 including the `u=0` baseline on the current data, so it does not
+discriminate methods; report the joint-space RMSE as the headline.
+
+## Forward-solve verification (dynamic feasibility)
+
+After fitting (or at the `u=0` baseline), verify that the planned joint paths
+actually execute under contact physics — the arm picks the object up and places
+it where the skeleton says. This catches issues that kinematic replay hides:
+servo tracking lag, joint-limit clipping, collisions with stacked geometry, and
+release targets that land outside the bucket.
+
+All three domains share the same two-stage pipeline:
+
+### 1. Extract joint paths
+
+```bash
+CUDA_VISIBLE_DEVICES=<idx> XLA_PYTHON_CLIENT_PREALLOCATE=false \
+  python -m iosp.checks.forward_extract <domain> --out scratch/feas/<domain>.npz
+```
+
+where `<domain>` is `tetris`, `tower`, or `pickplace`. Each calls its own
+experiment's `build()` and rolls out `paths_fn(u=0)` to produce an `.npz` with
+`q` (joint paths), pick/place targets, and domain metadata.
+
+- **tetris**: `e8_tetris.build`, Panda, 3-block packing, 60 L-BFGS iters.
+- **tower**: `e9_tower.build`, Panda, 6 synthetic scenes, 60 iters.
+- **pickplace**: `build_pick_and_place` (FR3 teleop scenes), `pin_ik="bucket"`,
+  `freeze_ik=True`, 600 iters. This is the same pipeline `e10_method_comparison`
+  uses — the robot is an FR3 and the scenes are the recorded teleop episodes.
+
+### 2. Run through MuJoCo physics
+
+```bash
+MUJOCO_GL=egl python -m iosp.checks.dynamic_report scratch/feas/*.npz
+```
+
+Reads each `.npz`, builds the domain's MuJoCo scene (pedestal + carried object
+for pickplace, goal region for tetris, stacked blocks for tower), drives the
+arm through the waypoints under gravity, and reports per-scene success:
+
+- **tetris** / **tower**: scored on the object's *settled* position after the
+  arm releases and the block comes to rest. Success = within 5 cm of target.
+- **pickplace (FR3)**: scored on bucket landing via `e10_spasm_sim.physics_success`
+  — the cube must end inside the bucket under contact-driven physics (no
+  kinematic attach hack). Reports `dxy` (horizontal distance from bucket centre)
+  and `dz` (height above bucket floor).
+
+The report also breaks tracking error into joint-limit overshoot vs physical
+obstruction, which tells you whether a failure is the plan's fault or the
+scene's.
+
+### Current baselines (u=0)
+
+| domain    | success | notes |
+|-----------|---------|-------|
+| tetris    | 5/6     | one scene has a tight packing that clips a wall |
+| tower     | 4/6     | arm collides with already-stacked blocks during dynamic execution |
+| pickplace | 10/10   | with `pin_ik="bucket"` and 600 iters |
+
+### 3. Visualize the rollout
+
+Each domain has a viser-based 3D viewer that replays the `.npz` in a MuJoCo
+scene with contact rendering, a playback scrubber, and per-row contact reports.
+No GPU needed — the viewer reads the saved joint paths.
+
+```bash
+# tetris — shows goal region, packed tetrominos, contact depths
+python -m iosp.viz.tetris_viser --from-npz scratch/feas/tetris.npz
+
+# tower — shows stacking base, existing tower, obstacle spheres
+python -m iosp.viz.tower_viser --from-npz scratch/feas/tower.npz
+
+# pickplace (Panda synthetic) — shows pedestal, carried box, obstacle
+python -m iosp.viz.pickplace_viser --from-npz scratch/feas/pickplace.npz
+```
+
+Opens a browser viewer (default port 8080; pass `--port <N>` if taken). Multiple
+scenes are laid out side-by-side. The playback panel reports the deepest contact
+on each row — the `feasibility_report` verdict, frame by frame.
+
+For FR3 teleop pickplace specifically, `e10_methods_viser` shows side-by-side
+physics playback of multiple methods' reconstructions in the teleop scene:
+
+```bash
+MUJOCO_GL=egl python -m iosp.viz.e10_methods_viser \
+    --results-dir iosp/data/results/e10_methods_perseg_r3_ms3 \
+    --methods demo,fd,cmaes,implicit \
+    --episode-index 0 --port 8081
+```
+
+<!-- ### Standalone pickplace check
+
+`pickplace_sim.py` is a lighter-weight script that builds and tests pickplace
+in one step (no `.npz` intermediate), useful for quick iteration:
+
+```bash
+CUDA_VISIBLE_DEVICES=<idx> XLA_PYTHON_CLIENT_PREALLOCATE=false MUJOCO_GL=egl \
+  python -m iosp.checks.pickplace_sim [--n-iters 600] [--pin-ik bucket]
+```
+
+Pass `--u '<json list>'` to test with recovered weights instead of `u=0`. -->
 
 ## Reading the results honestly
 

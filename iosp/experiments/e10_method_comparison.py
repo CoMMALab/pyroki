@@ -1,5 +1,8 @@
 """E10 method comparison: CMA-ES, unrolled autodiff, implicit diff, and FD
-on the 10 human teleop episodes, with 8/2 fit/held-out split.
+on the human teleop episodes, with a CROSS-SESSION fit/held-out split: the 27
+episodes of the 2026-09-03 session are fitted, the 10 of the 2026-09-02 session
+(the original set, which used to be split 8/2 within itself) are held out in
+full.  See `iosp.fit.teleop.FIT_DEMO_DIR`.
 
 Saves structured results (JSON + NPZ) for later visualization and tables.
 
@@ -31,6 +34,7 @@ from iosp.fit.parametric import _build_inner, screen_stationarity
 from iosp.fit.params import z_scale
 from iosp.model import fr3, pickplace as pp
 from iosp.model.pickplace import split_trajopt as _split_trajopt
+from iosp.model.pickplace import split_trajopt_perseg as _split_trajopt_perseg
 from ioc.robot.problem import Scene
 
 OUT_DIR = pathlib.Path(__file__).resolve().parents[1] / "data" / "results" / "e10_methods"
@@ -83,18 +87,60 @@ def _gram(built, u):
     )
 
 
-def _batched_adam(vg, seeds, lr, n_steps):
+def _chunked_eval(vg, U, chunk):
+    """`vg(U)` for a (S, K) seed batch, evaluated `chunk` rows at a time.
+
+    EXACTLY equivalent to `vg(U)`: each row's (value, gradient) is independent
+    -- the seeds never interact inside the forward map -- so splitting the
+    batch changes only peak memory, never a number.
+
+    It is needed because the whole seed batch does not fit.  MEASURED on a
+    24 GiB A5000 at 25 fit + 5 held episodes and K=28: the 3-seed
+    `jit_loss_a` asks for 10.33 GiB on top of its live buffers and dies with
+    RESOURCE_EXHAUSTED, where one seed at a time fits comfortably.  It costs
+    almost nothing in wall-clock: a single 30-episode solve already saturates
+    the card, so the seed axis was never actually running in parallel --
+    measured, batching 2 candidates instead of 1 bought 1.11x, and 4 bought
+    1.17x.  The batch was buying memory pressure, not throughput.
+
+    The last chunk is PADDED to a full `chunk` rows (by repeating the final
+    seed) so every call has one shape and XLA compiles the program once.
+    """
+    S = U.shape[0]
+    if chunk is None or chunk >= S:
+        return vg(U)
+    vals, grads = [], []
+    for i in range(0, S, chunk):
+        block = U[i:i + chunk]
+        pad = chunk - block.shape[0]
+        if pad:
+            block = jnp.concatenate([block, jnp.repeat(block[-1:], pad, axis=0)])
+        v, g = vg(block)
+        if pad:
+            v, g = v[:chunk - pad], g[:chunk - pad]
+        vals.append(v)
+        grads.append(g)
+    return jnp.concatenate(vals), jnp.concatenate(grads)
+
+
+def _batched_adam(vg, seeds, lr, n_steps, chunk=None):
     """One Adam over a (S, K) seed batch driven by a vmapped `(value, grad)` fn;
     returns (u_hat, best_vals, hist, t_compile, t_infer).  Each row gets its own
     exact gradient (no interaction), and the winner is the best TRAINING loss
-    across seeds -- rollout success is never consulted."""
+    across seeds -- rollout success is never consulted.
+
+    `chunk` caps how many seeds are evaluated at once; see `_chunked_eval`.
+    The Adam update itself stays over the full (S, K) array, so the optimiser
+    state and the step arithmetic are unchanged."""
     import optax
 
     U = jnp.stack([jnp.asarray(s, jnp.float32) for s in seeds])   # (S, K)
     t0 = time.perf_counter()
-    v0, _ = vg(U); v0.block_until_ready()
+    v0, _ = _chunked_eval(vg, U, chunk); v0.block_until_ready()
     t_compile = time.perf_counter() - t0
-    print(f"  compile: {t_compile:.1f}s  ({U.shape[0]} seeds batched)", flush=True)
+    print(f"  compile: {t_compile:.1f}s  ({U.shape[0]} seeds"
+          f"{f', {chunk} at a time' if chunk and chunk < U.shape[0] else ' batched'})",
+          flush=True)
 
     opt = optax.adamw(lr, weight_decay=0.0)
     state = opt.init(U)
@@ -103,7 +149,7 @@ def _batched_adam(vg, seeds, lr, n_steps):
     hist = []
     t0 = time.perf_counter()
     for _ in range(n_steps):
-        vals, grads = vg(U)
+        vals, grads = _chunked_eval(vg, U, chunk)
         improved = vals < best_vals
         best_U = jnp.where(improved[:, None], U, best_U)
         best_vals = jnp.where(improved, vals, best_vals)
@@ -115,13 +161,13 @@ def _batched_adam(vg, seeds, lr, n_steps):
     return np.asarray(best_U[i]), np.asarray(best_vals), hist, t_compile, t_infer
 
 
-def run_implicit_parallel(built, seeds, lr=LR, n_steps=N_OUTER_STEPS):
+def run_implicit_parallel(built, seeds, lr=LR, n_steps=N_OUTER_STEPS, chunk=None):
     """Implicit-diff multistart as ONE batched program: `value_and_grad` vmapped
     over the (S, K) seeds, one batched Adam.  The IK `custom_vmap` folds the seed
     axis into the kernel's problem batch, so S seeds cost ~one seed."""
     print("\n=== Implicit diff (parallel multistart) ===", flush=True)
     vg = jax.jit(jax.vmap(built["gf"]))
-    u_hat, best_vals, hist, tc, ti = _batched_adam(vg, seeds, lr, n_steps)
+    u_hat, best_vals, hist, tc, ti = _batched_adam(vg, seeds, lr, n_steps, chunk)
     starts = [round(float(v), 4) for v in best_vals]
     print(f"  fit: {ti:.1f}s  winner loss {min(starts):.4f} "
           f"(per-seed best: {starts})", flush=True)
@@ -131,7 +177,7 @@ def run_implicit_parallel(built, seeds, lr=LR, n_steps=N_OUTER_STEPS):
                 n_starts=len(seeds), start_losses=starts)
 
 
-def run_fd_parallel(built, seeds, lr=LR, n_steps=N_OUTER_STEPS):
+def run_fd_parallel(built, seeds, lr=LR, n_steps=N_OUTER_STEPS, chunk=None):
     """Finite-difference multistart, batched: the value-only loss's FD gradient
     (K+1 probes) is vmapped over the seeds and one batched Adam updates them.
     Same eager-loop reasoning as `run_fd` (no scan inlining the K+1 solves), but
@@ -139,7 +185,7 @@ def run_fd_parallel(built, seeds, lr=LR, n_steps=N_OUTER_STEPS):
     print("\n=== Finite differences (parallel multistart) ===", flush=True)
     fd_gf = outer_opt.fd_grad_fn(built["loss"], FD_EPS, batched=False)
     vg = jax.jit(jax.vmap(fd_gf))
-    u_hat, best_vals, hist, tc, ti = _batched_adam(vg, seeds, lr, n_steps)
+    u_hat, best_vals, hist, tc, ti = _batched_adam(vg, seeds, lr, n_steps, chunk)
     starts = [round(float(v), 4) for v in best_vals]
     print(f"  fit: {ti:.1f}s  winner loss {min(starts):.4f} "
           f"(per-seed best: {starts})", flush=True)
@@ -162,7 +208,8 @@ def run_implicit(built, u0):
     t0 = time.perf_counter()
     u_hat, trace = ident.wide_fit(gf, u0, lr=LR, n_steps=N_OUTER_STEPS)
     t_infer = time.perf_counter() - t0
-    print(f"  fit: {t_infer:.1f}s  loss {trace[0][1]:.4f} → {trace[-1][1]:.4f}", flush=True)
+    best_loss = min(v for _, v in trace)
+    print(f"  fit: {t_infer:.1f}s  loss {trace[0][1]:.4f} → {best_loss:.4f} (best of {len(trace)} steps)", flush=True)
 
     return dict(
         method="implicit",
@@ -209,7 +256,8 @@ def run_fd(built, u0):
         trace.append((int((step + 1) * (K + 1)), val))
     u_hat = best_z
     t_infer = time.perf_counter() - t0
-    print(f"  fit: {t_infer:.1f}s  loss {trace[0][1]:.4f} → {trace[-1][1]:.4f}", flush=True)
+    best_loss = min(v for _, v in trace)
+    print(f"  fit: {t_infer:.1f}s  loss {trace[0][1]:.4f} → {best_loss:.4f} (best of {len(trace)} steps)", flush=True)
 
     return dict(
         method="fd",
@@ -244,7 +292,8 @@ def run_cmaes(built, u0):
     )
     t_infer = time.perf_counter() - t0
     u_hat = jnp.asarray(u_hat, dtype=jnp.float32)
-    print(f"  fit: {t_infer:.1f}s  loss {trace[0][1]:.4f} → {trace[-1][1]:.4f}", flush=True)
+    best_loss = min(v for _, v in trace)
+    print(f"  fit: {t_infer:.1f}s  loss {trace[0][1]:.4f} → {best_loss:.4f} (best of {len(trace)} steps)", flush=True)
 
     return dict(
         method="cmaes",
@@ -285,7 +334,8 @@ def run_cmaes_parallel(built, seeds):
 
 
 def run_unrolled(built, seeds, compile_timeout=1800, freeze_ik=False, ee_weight=0.0,
-                 pin_ik=None, upright_floor=0.0, free_space_only=False):
+                 pin_ik=None, upright_floor=0.0, free_space_only=False,
+                 per_segment=False, chunk=None):
     """Unrolled autodiff through the last `unroll_tail` solver iterations.
 
     Requires rebuilding the inner solvers with a differentiable forward solver.
@@ -363,36 +413,22 @@ def run_unrolled(built, seeds, compile_timeout=1800, freeze_ik=False, ee_weight=
     else:
         theta_ik_pinned = None
 
+    _nf = pp.N_FEAT_PER_SEG
+
     def _weights(z_traj):
-        w = jax.nn.softmax(z_traj)
-        if upright_floor > 0.0:
-            # RENORMALIZED.  The previous version raised the upright entry in
-            # place and left the rest alone, so the weights no longer summed to
-            # 1 and the floor was an ABSOLUTE weight no amount of fitting could
-            # outrank: at the uniform init it sat at 0.25 against ~0.09 for
-            # every other feature, and the only way any method could reduce it
-            # was to drive one smoothness logit to the simplex corner and swamp
-            # it (measured: that is exactly and only what CMA-ES found).  Worse,
-            # a constant entry has zero gradient through the softmax except via
-            # the denominator, so the floored coordinate's gradient collapsed to
-            # the generic value shared by every inert feature -- the fit could
-            # not see the term it was being forced to pay.  Rescaling the
-            # remaining mass keeps the floor a genuine lower bound on a SHARE
-            # while leaving the simplex intact.
-            w = w.at[UPRIGHT_IDX].set(jnp.maximum(w[UPRIGHT_IDX], upright_floor))
-            others = jnp.delete(jnp.arange(w.shape[0]), UPRIGHT_IDX,
-                                assume_unique_indices=True)
-            rest = w[others]
-            w = w.at[others].set(rest * (1.0 - w[UPRIGHT_IDX])
-                                 / jnp.maximum(rest.sum(), 1e-12))
-        return w
+        if per_segment:
+            return jnp.concatenate([jax.nn.softmax(z_traj[i * _nf:(i + 1) * _nf])
+                                    for i in range(len(pp.PHASES))])
+        return jax.nn.softmax(z_traj)
+
+    _do_split = _split_trajopt_perseg if per_segment else _split_trajopt
 
     def _rollout_unrolled(u):
         z = z_of(u)
         theta_ik = theta_ik_pinned if theta_ik_pinned is not None else z[:pp.K_IK]
         z_traj = z[pp.K_IK:]
         x0, phase_sc, _, _ = prob.seeds(scenes, theta_ik)
-        by_phase = _split_trajopt(_weights(z_traj))
+        by_phase = _do_split(_weights(z_traj))
         xs = {}
         for phase in pp.PHASES:
             xs[phase] = jax.vmap(inner_unrolled[phase].solve_unrolled,
@@ -429,7 +465,7 @@ def run_unrolled(built, seeds, compile_timeout=1800, freeze_ik=False, ee_weight=
     signal.alarm(compile_timeout)
     try:
         t_compile_start = time.perf_counter()
-        _ = vg(U0) if multi else gf_unrolled(u0)
+        _ = (_chunked_eval(vg, U0, chunk) if multi else gf_unrolled(u0))
         t_compile = time.perf_counter() - t_compile_start
         signal.alarm(0)
     except CompileTimeout:
@@ -449,7 +485,7 @@ def run_unrolled(built, seeds, compile_timeout=1800, freeze_ik=False, ee_weight=
           f"{f'  ({len(seeds)} seeds batched)' if multi else ''}", flush=True)
 
     if multi:
-        u_hat, best_vals, hist, _, t_infer = _batched_adam(vg, seeds, LR, N_OUTER_STEPS)
+        u_hat, best_vals, hist, _, t_infer = _batched_adam(vg, seeds, LR, N_OUTER_STEPS, chunk)
         starts = [round(float(v), 4) for v in best_vals]
         trace = [(0, hist[0]), (N_OUTER_STEPS, hist[-1])]
         print(f"  fit: {t_infer:.1f}s  winner loss {min(starts):.4f} "
@@ -486,10 +522,15 @@ def rollout_success(built, u_hat, label=""):
     from iosp.viz.e10_spasm_sim import physics_success
     J = np.asarray(built["paths_fn"](jnp.asarray(u_hat)))   # (B, T, dof)
     fit_idx, gen_idx = list(built["fit_idx"]), list(built["gen_idx"])
+    # Each row is scored in ITS OWN episode's scene.  Passing the path rather
+    # than the row index matters as soon as the batch is not one directory in
+    # order -- see `physics_success`.
+    ep_paths = built.get("episode_paths")
     per = []
     t0 = time.perf_counter()
     for i in range(J.shape[0]):
-        r = physics_success(i, J[i], verbose=False)
+        r = physics_success(i, J[i], verbose=False,
+                            episode_path=(ep_paths[i] if ep_paths else None))
         per.append(r)
         tag = "fit " if i in fit_idx else "held"
         print(f"    [{label}] ep{i} {tag} {'OK  ' if r['success'] else 'FAIL'} "
@@ -504,6 +545,19 @@ def rollout_success(built, u_hat, label=""):
         gen_success=int(gen_succ), gen_total=len(gen_idx),
         details=[{k: v for k, v in p.items() if k != "cube"} for p in per],
     )
+
+
+def _json_default(o):
+    """`json.dumps` fallback.  Non-finite floats become `null`: a literal
+    `Infinity` is what `json` emits by default and it is not valid JSON, so a
+    diverged fit would otherwise produce a results file nothing can read back."""
+    if isinstance(o, (np.floating, float)):
+        return None if not np.isfinite(o) else float(o)
+    if isinstance(o, np.integer):
+        return int(o)
+    if isinstance(o, np.ndarray):
+        return o.tolist()
+    return None
 
 
 def _failed_result(method, reason):
@@ -545,7 +599,7 @@ def main():
     parser.add_argument("--free-space-only", action="store_true",
                         help="fit the loss on free-space rows only (exclude event "
                              "rows 7/10/19 that the constraints fix)")
-    parser.add_argument("--n-starts", type=int, default=1,
+    parser.add_argument("--n-starts", type=int, default=3,
                         help="outer multistart: fit each method from N seeds "
                              "(u=0 plus N-1 random) and keep the best by TRAINING "
                              "loss (never rollout success). 1 = single start.")
@@ -553,6 +607,12 @@ def main():
                         help="comma-separated phases to put a HARD (AL) grasp-"
                              "maintenance constraint on, e.g. 'transport' or "
                              "'grasp,transport' (empty = soft only)")
+    parser.add_argument("--per-segment", action="store_true",
+                        help="learn cost weights per segment (4x features) "
+                             "instead of shared across all phases")
+    parser.add_argument("--n-restarts", type=int, default=3,
+                        help="inner solver restarts per segment (>1 stabilises "
+                             "multimodal segments like transport)")
     args = parser.parse_args()
     hard_upright = tuple(p.strip() for p in args.hard_upright.split(",") if p.strip())
 
@@ -564,22 +624,27 @@ def main():
 
     print(f"Building teleop forward map... (freeze_ik={args.freeze_ik}, "
           f"ee_weight={args.ee_weight}, pin_ik={args.pin_ik}, "
-          f"upright_floor={args.upright_floor}, free_space_only={args.free_space_only})",
+          f"upright_floor={args.upright_floor}, free_space_only={args.free_space_only}, "
+          f"per_segment={args.per_segment}, n_restarts={args.n_restarts})",
           flush=True)
     built = build_teleop(n_iters=600, space="joint", freeze_ik=args.freeze_ik,
                          ee_weight=args.ee_weight, pin_ik=args.pin_ik,
                          upright_floor=args.upright_floor,
                          free_space_only=args.free_space_only,
-                         hard_upright=hard_upright)
+                         hard_upright=hard_upright,
+                         per_segment=args.per_segment,
+                         n_restarts=args.n_restarts)
     K = built["K"]
     u0 = jnp.zeros(K, dtype=jnp.float32)
 
     print(f"\n{len(built['episodes'])} episodes: {built['n_fit']} fit / "
           f"{len(built['gen_idx'])} held out")
 
-    # Baseline (random init)
-    init_metrics = _metrics(built, u0)
-    print(f"\nBaseline (u=0): loss={init_metrics['loss']:.4f}  "
+    # Baseline: random init (normal draw) to show what un-optimised looks like
+    rng_init = np.random.default_rng(42)
+    u_rand = jnp.asarray(rng_init.normal(0, 1.0, K), jnp.float32)
+    init_metrics = _metrics(built, u_rand)
+    print(f"\nBaseline (random): loss={init_metrics['loss']:.4f}  "
           f"ee_fit={init_metrics['ee_rmse_fit']:.4f}m  "
           f"ee_gen={init_metrics['ee_rmse_gen']:.4f}m")
 
@@ -601,7 +666,8 @@ def main():
     # is best TRAINING loss across seeds; rollout success is never consulted.
     unroll_kw = dict(compile_timeout=args.compile_timeout, freeze_ik=args.freeze_ik,
                      ee_weight=args.ee_weight, pin_ik=args.pin_ik,
-                     upright_floor=args.upright_floor, free_space_only=args.free_space_only)
+                     upright_floor=args.upright_floor, free_space_only=args.free_space_only,
+                     per_segment=args.per_segment)
     multi = len(seeds) > 1
 
     def dispatch(name):
@@ -645,7 +711,7 @@ def main():
     # Reconstruction ROLLOUT SUCCESS: execute each fitted construction in
     # contact physics and count cube-in-bucket, per episode (fit + held out).
     print("\n=== Rollout success (physics) ===", flush=True)
-    init_roll = rollout_success(built, u0, label="init")
+    init_roll = rollout_success(built, u_rand, label="init")
     for name, r in results.items():
         if r["u_hat"] is not None:
             r["rollout"] = rollout_success(built, jnp.asarray(r["u_hat"]), label=name)
@@ -727,15 +793,6 @@ def main():
         if r.get("diverged"):
             entry["diverged"] = True
         summary["methods"][name] = entry
-    def _json_default(o):
-        if isinstance(o, (np.floating, float)):
-            return None if not np.isfinite(o) else float(o)
-        if isinstance(o, np.integer):
-            return int(o)
-        if isinstance(o, np.ndarray):
-            return o.tolist()
-        return None
-
     with open(out / "summary.json", "w") as f:
         json.dump(summary, f, indent=2, default=_json_default)
 

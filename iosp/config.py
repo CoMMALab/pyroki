@@ -35,7 +35,21 @@ MESH_DIR = RESOURCE_ROOT / "panda" / "meshes"
 # and every experiment here shares the approach/grasp/place subgraphs, so the
 # persistent cache is the difference between a 25-minute rerun and a 2-minute
 # one.  `enable_compilation_cache()` must be called before the first trace.
-CACHE_DIR = pathlib.Path(__file__).resolve().parent / "data" / "jax_cache"
+#
+# NOT SAFE TO SHARE BETWEEN CONCURRENT PROCESSES.  XLA stages this directory's
+# `xla_gpu_per_fusion_autotune_cache_dir/tmp/` entries and renames them into
+# place, and two processes autotuning at once delete each other's staging
+# files -- the loser dies with
+#     NOT_FOUND: .../xla_gpu_per_fusion_autotune_cache_dir/tmp/tmp_per_fusion_cache_*.textproto
+# MEASURED: three E10 method fits plus a ladder launched together all died in
+# compile this way, while one or two at a time had run fine for hours.  So set
+# `IOSP_JAX_CACHE_DIR` to a per-process path whenever more than one experiment
+# runs at the same time (`iosp/scripts/run_e10_ablation.sh` gives every worker
+# its own).  The cost is that each worker compiles its own copy -- 1.5-3 min
+# here, against a run that dies outright.
+CACHE_DIR = pathlib.Path(
+    os.environ.get("IOSP_JAX_CACHE_DIR",
+                   pathlib.Path(__file__).resolve().parent / "data" / "jax_cache"))
 
 
 def setup():
@@ -89,8 +103,8 @@ Z_FULL_STAR = jnp.array([0.5, 1.0, 2.0, 0.5, 1.0, 2.0, 1.5], dtype=jnp.float32)
 
 # -- the canonical task ------------------------------------------------------
 Q_START = jnp.array([0.0, -0.6, 0.0, -2.2, 0.0, 1.6, 0.8], dtype=jnp.float32)
-PICK_POS = jnp.array([0.4, 0.2, 0.3], dtype=jnp.float32)
-PLACE_POS = jnp.array([0.4, -0.2, 0.3], dtype=jnp.float32)
+PICK_POS = jnp.array([0.4, 0.2, 0.325], dtype=jnp.float32)
+PLACE_POS = jnp.array([0.4, -0.2, 0.325], dtype=jnp.float32)
 OBS_CENTER = jnp.array([0.3, 0.0, 0.4], dtype=jnp.float32)
 OBS_RADIUS = jnp.array([0.05], dtype=jnp.float32)
 

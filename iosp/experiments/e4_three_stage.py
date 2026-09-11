@@ -29,12 +29,54 @@ from iosp.config import MESH_DIR, SRDF_PATH, URDF_PATH
 from iosp.model.scenes import sample_pickplace_scenes
 
 # Fixed, NOT estimated: IK is a seeding step, not a preference.
-THETA_IK = jnp.array([0.06, 0.04], dtype=jnp.float32)
+THETA_IK = jnp.array([0.105, 0.105, 0.0, 0.0], dtype=jnp.float32)
 
 # Ground truth, pre-softmax.  `skeleton` highest: a demonstrator that mostly
 # honours the task skeleton but will trade some fidelity for global smoothness
 # -- that exchange rate is what this study recovers.
-Z_STAR = jnp.array([1.0, 1.5, 0.5, 1.0, 2.5], dtype=jnp.float32)  # smooth,clearance,upright,torque,skeleton
+#
+# SELECTED BY MEASUREMENT over 24 candidate vectors, in three rounds, each one
+# solved through the full three-stage chain and executed through the actuated
+# MuJoCo rollout (`spasm_rollout.rollout_and_score_pickplace`, all 6 fit scenes,
+# every run carrying the `mj_rollout.run_events` grasp-timing fix).  Success is
+# settled position AND upright; the `err`/`tilt` columns are the first three
+# scenes, which are the only ones any vector solves.
+#
+#   name          vector                                   ok    err mm    tilt
+#   base          [1.0, 1.5, 0.5, 0.5, 1.0, 1.5, 2.5]     1/6   39/38/32   0/90/90
+#   THIS          [1.0, 1.5, 1.5, 2.0, 1.0, 1.5, 4.5]     3/6   23/29/23   0/0/0
+#   smooth_skel   [1.0, 1.5, 1.5, 2.0, 1.0, 1.5, 3.5]     3/6   23/27/26   0/0/0
+#   smooth_only   [1.0, 1.5, 1.5, 2.0, 1.0, 1.5, 2.5]     3/6   25/43/21   0/0/0
+#   jerk_only     [1.0, 1.5, 0.5, 2.5, 1.0, 1.5, 2.5]     2/6   29/43/37   0/0/90
+#   clearance-max [1.0, 1.0, 2.5, 3.0, 0.5, 3.5, 2.5]     2/6   42/46/33   0/90/0
+#   smooth_more   [1.0, 1.5, 2.0, 3.0, 1.0, 1.5, 2.5]     0/6   20/37/16   90/90/90
+#   effort_max    [1.0, 1.5, 0.5, 0.5, 3.0, 1.5, 2.5]     0/6  405/439/468 90/90/90
+#
+# `smooth_skel` ties this vector at 3/6 (mean settled error 25.3 mm against
+# 25.0); the tie was broken on that mean and the difference is within noise.
+#
+# What the sweep actually shows, and the reason the winner looks the way it does:
+# raising `accel`/`jerk` from 0.5 to 1.5/2.0 is what buys the wins, and every
+# variant that ALSO raises `clearance` gives them back.  Note `smooth_more`,
+# which has the LOWEST position errors in the whole sweep (16-37 mm) and scores
+# 0/6: it lands the cube dead on target and topples it every time.  Position
+# accuracy and settled uprightness are close to anti-correlated here, because a
+# heavier smoothness or clearance term lifts the release and nothing in
+# `STANDARD_FEATURES` prices drop height -- `upright_constraint_fn` holds the
+# GRIPPER level but says nothing about how far the object then falls.  Chasing
+# error alone selects vectors that fail.
+#
+# Scenes 3/4/5 fail under ALL 24 vectors (448/~200/407 mm, cube never leaves the
+# table), so 3/6 is the ceiling reachable by reweighting and the rest is not a
+# weight problem: the synthetic scenes carry `table_box=None` and
+# `PickPlaceProblem.full_scenes` does not forward `table_box`/`obs_spheres`
+# anyway, so the planner's world is a single obstacle sphere with no table in
+# it.  `clearance` at any weight prices distance to that sphere, not to the
+# table the arm actually hits.
+#
+# CHANGES RECORDED NUMBERS: every E4 result and every saved forward extract
+# predating this used [1.0, 1.5, 0.5, 0.5, 1.0, 1.5, 2.5].
+Z_STAR = jnp.array([1.0, 1.5, 1.5, 2.0, 1.0, 1.5, 4.5], dtype=jnp.float32)  # time,path,accel,jerk,effort,clearance,skeleton
 PARAM_NAMES = list(pp.THETA_SHARED_NAMES)
 
 
@@ -49,9 +91,7 @@ def build(seed=0, n_iters=60, n_scenes=6, constrained=False):
     claim is behavioural fidelity, so that is the wrong trade.
     """
     prob = pp.PickPlaceProblem.load(str(URDF_PATH), str(SRDF_PATH), str(MESH_DIR))
-    forward_solver = pp.make_composed_forward_solver(
-        n_iters=n_iters, soft_line_search=False, soft_curvature_gate=False,
-        robot=prob.base.robot)
+    forward_solver = pp.make_stock_forward_solver(n_iters=n_iters)
 
     rng = np.random.default_rng(seed)
     scenes_all = sample_pickplace_scenes(rng, 2 * n_scenes)
